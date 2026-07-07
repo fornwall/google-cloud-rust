@@ -26,6 +26,7 @@ pub use crate::read::ConfiguredReadRequestBuilder;
 pub use crate::read::ReadRequestBuilder;
 pub use crate::read_only_transaction::MultiUseReadOnlyTransactionBuilder;
 pub use crate::read_only_transaction::SingleUseReadOnlyTransactionBuilder;
+pub use crate::statement_based_transaction::StatementBasedReadWriteTransactionBuilder;
 pub use crate::transaction_runner::TransactionRunnerBuilder;
 pub use crate::write_only_transaction::WriteOnlyTransactionBuilder;
 
