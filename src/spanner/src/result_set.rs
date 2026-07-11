@@ -58,7 +58,10 @@ use futures::Stream;
 #[derive(Debug)]
 pub struct ResultSet {
     stream: Option<PartialResultSetStream>,
-    buffered_values: Vec<prost_types::Value>,
+    // A `VecDeque` (not a `Vec`) so that draining complete rows off the front is O(row width)
+    // rather than O(remaining buffer): a `Vec` front-drain memmoves the whole tail down on every
+    // row, making a PartialResultSet that packs R rows cost O(R^2). See `process_partial_result_set`.
+    buffered_values: VecDeque<prost_types::Value>,
     chunked: bool,
     seen_last: bool,
     ready_rows: VecDeque<Row>,
@@ -131,7 +134,7 @@ impl ResultSet {
 
         Self {
             stream: Some(stream),
-            buffered_values: Vec::new(),
+            buffered_values: VecDeque::new(),
             chunked: false,
             seen_last: false,
             ready_rows: VecDeque::new(),
@@ -589,7 +592,7 @@ impl ResultSet {
 
         let mut values_iter = values.into_iter();
         if self.chunked
-            && let Some(last_val) = self.buffered_values.last_mut()
+            && let Some(last_val) = self.buffered_values.back_mut()
             && let Some(first_new) = values_iter.next()
         {
             merge_values(last_val, first_new)?;
@@ -598,8 +601,17 @@ impl ResultSet {
         self.buffered_values.extend(values_iter);
         self.chunked = chunked_value;
 
-        while self.buffered_values.len() >= metadata.column_types.len() {
-            let column_count = metadata.column_types.len();
+        // Emit every currently-complete row. Because `buffered_values` is a `VecDeque`, draining
+        // `column_count` values off the front is O(column_count) (the head pointer just advances),
+        // so emitting R rows from a PartialResultSet is O(total values). A `Vec` front-drain would
+        // instead memmove the whole remaining buffer down on every row — O(R^2) — which dominates
+        // large reads since servers pack many rows per PartialResultSet.
+        let column_count = metadata.column_types.len();
+        self.ready_rows
+            .reserve(self.buffered_values.len() / column_count);
+        while self.buffered_values.len() >= column_count {
+            // Hold back the final row while its trailing value may still be continued in the next
+            // PartialResultSet (`self.chunked`) and the buffer sits exactly on a row boundary.
             if self.buffered_values.len() == column_count && self.chunked {
                 break;
             }
@@ -1607,6 +1619,178 @@ pub(crate) mod tests {
             assert_eq!(s, "hello world");
         } else {
             panic!("Expected StringValue");
+        }
+        assert!(rs.next().await.is_none());
+    }
+
+    #[tokio_test_no_panics]
+    async fn test_result_set_many_rows_in_one_partial_result_set() {
+        // A single PartialResultSet carrying many rows must be split into exactly those rows, in
+        // order. This is the common shape (servers pack many rows per message) and the case whose
+        // row extraction must stay O(n): draining `column_count` off the front per row is O(n^2).
+        let rows = 1000;
+        let cols = 2;
+        let mut values = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            values.push(string_val(&format!("r{r}c0")));
+            values.push(string_val(&format!("r{r}c1")));
+        }
+        let mut rs = run_mock_query(vec![PartialResultSet {
+            metadata: metadata(cols),
+            values,
+            last: true,
+            ..Default::default()
+        }])
+        .await;
+
+        for r in 0..rows {
+            let row = rs.next().await.expect("expected a row").expect("row ok");
+            assert_eq!(row.raw_values().len(), cols);
+            let got: Vec<&str> = row
+                .raw_values()
+                .iter()
+                .map(|v| match &v.0.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s.as_str(),
+                    _ => panic!("Expected StringValue"),
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![format!("r{r}c0").as_str(), format!("r{r}c1").as_str()]
+            );
+        }
+        assert!(rs.next().await.is_none());
+    }
+
+    #[tokio_test_no_panics]
+    async fn test_result_set_multiple_rows_split_across_partial_result_sets() {
+        // Rows split across PartialResultSet boundaries (including a value chunked across the
+        // boundary) must reassemble correctly with the drain-once row extraction.
+        let mut rs = run_mock_query(vec![
+            // Two full rows plus the first (chunked) value of a third row.
+            PartialResultSet {
+                metadata: metadata(2),
+                values: vec![
+                    string_val("a0"),
+                    string_val("a1"),
+                    string_val("b0"),
+                    string_val("b1"),
+                    string_val("c0-part"),
+                ],
+                chunked_value: true,
+                resume_token: b"t".to_vec(),
+                ..Default::default()
+            },
+            // Continuation of c0, then c1 completes the third row.
+            PartialResultSet {
+                metadata: None,
+                values: vec![string_val("-rest"), string_val("c1")],
+                last: true,
+                ..Default::default()
+            },
+        ])
+        .await;
+
+        for want in [["a0", "a1"], ["b0", "b1"], ["c0-part-rest", "c1"]] {
+            let row = rs.next().await.expect("expected a row").expect("row ok");
+            let got: Vec<&str> = row
+                .raw_values()
+                .iter()
+                .map(|v| match &v.0.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s.as_str(),
+                    _ => panic!("Expected StringValue"),
+                })
+                .collect();
+            assert_eq!(got, want.to_vec());
+        }
+        assert!(rs.next().await.is_none());
+    }
+
+    #[tokio_test_no_panics]
+    async fn test_result_set_chunked_on_exact_row_boundary_holds_back_last_row() {
+        // The buffer ends on an exact row boundary (4 values == 2 rows) with chunked_value=true,
+        // so the final row's trailing value may still grow and MUST be held back rather than
+        // emitted early. This exercises the `len == column_count && chunked` break — the one
+        // hold-back case the other row-extraction tests don't hit on a full row boundary.
+        let mut rs = run_mock_query(vec![
+            PartialResultSet {
+                metadata: metadata(2),
+                values: vec![
+                    string_val("a0"),
+                    string_val("a1"),
+                    string_val("b0"),
+                    string_val("b1-part"),
+                ],
+                chunked_value: true,
+                resume_token: b"t".to_vec(),
+                ..Default::default()
+            },
+            // Continuation merges into "b1-part" => "b1-part-rest", completing the held-back row.
+            PartialResultSet {
+                metadata: None,
+                values: vec![string_val("-rest")],
+                last: true,
+                ..Default::default()
+            },
+        ])
+        .await;
+
+        for want in [["a0", "a1"], ["b0", "b1-part-rest"]] {
+            let row = rs.next().await.expect("expected a row").expect("row ok");
+            let got: Vec<&str> = row
+                .raw_values()
+                .iter()
+                .map(|v| match &v.0.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s.as_str(),
+                    _ => panic!("Expected StringValue"),
+                })
+                .collect();
+            assert_eq!(got, want.to_vec());
+        }
+        assert!(rs.next().await.is_none());
+    }
+
+    #[tokio_test_no_panics]
+    async fn test_result_set_row_split_across_boundary_without_value_chunk() {
+        // Three columns; the first PartialResultSet ends mid-row on a value boundary with
+        // chunked_value=false, so the trailing partial row is buffered and completed by the next
+        // message with NO value merge. Guards the >2-column arithmetic and the non-chunked
+        // carry-over path (the merge branch must not fire on the buffered "b0").
+        let mut rs = run_mock_query(vec![
+            PartialResultSet {
+                metadata: metadata(3),
+                // 4 values, 3 columns => emit 1 row, carry 1 leftover value.
+                values: vec![
+                    string_val("a0"),
+                    string_val("a1"),
+                    string_val("a2"),
+                    string_val("b0"),
+                ],
+                chunked_value: false,
+                resume_token: b"t".to_vec(),
+                ..Default::default()
+            },
+            PartialResultSet {
+                metadata: None,
+                values: vec![string_val("b1"), string_val("b2")],
+                last: true,
+                ..Default::default()
+            },
+        ])
+        .await;
+
+        for want in [["a0", "a1", "a2"], ["b0", "b1", "b2"]] {
+            let row = rs.next().await.expect("expected a row").expect("row ok");
+            assert_eq!(row.raw_values().len(), 3);
+            let got: Vec<&str> = row
+                .raw_values()
+                .iter()
+                .map(|v| match &v.0.kind {
+                    Some(prost_types::value::Kind::StringValue(s)) => s.as_str(),
+                    _ => panic!("Expected StringValue"),
+                })
+                .collect();
+            assert_eq!(got, want.to_vec());
         }
         assert!(rs.next().await.is_none());
     }
