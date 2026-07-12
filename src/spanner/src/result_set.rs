@@ -58,7 +58,10 @@ use futures::Stream;
 #[derive(Debug)]
 pub struct ResultSet {
     stream: Option<PartialResultSetStream>,
-    buffered_values: Vec<prost_types::Value>,
+    // A `VecDeque` (not a `Vec`) so that draining complete rows off the front is O(row width)
+    // rather than O(remaining buffer): a `Vec` front-drain memmoves the whole tail down on every
+    // row, making a PartialResultSet that packs R rows cost O(R^2). See `process_partial_result_set`.
+    buffered_values: VecDeque<prost_types::Value>,
     chunked: bool,
     seen_last: bool,
     ready_rows: VecDeque<Row>,
@@ -131,7 +134,7 @@ impl ResultSet {
 
         Self {
             stream: Some(stream),
-            buffered_values: Vec::new(),
+            buffered_values: VecDeque::new(),
             chunked: false,
             seen_last: false,
             ready_rows: VecDeque::new(),
@@ -589,7 +592,7 @@ impl ResultSet {
 
         let mut values_iter = values.into_iter();
         if self.chunked
-            && let Some(last_val) = self.buffered_values.last_mut()
+            && let Some(last_val) = self.buffered_values.back_mut()
             && let Some(first_new) = values_iter.next()
         {
             merge_values(last_val, first_new)?;
@@ -598,8 +601,17 @@ impl ResultSet {
         self.buffered_values.extend(values_iter);
         self.chunked = chunked_value;
 
-        while self.buffered_values.len() >= metadata.column_types.len() {
-            let column_count = metadata.column_types.len();
+        // Emit every currently-complete row. Because `buffered_values` is a `VecDeque`, draining
+        // `column_count` values off the front is O(column_count) (the head pointer just advances),
+        // so emitting R rows from a PartialResultSet is O(total values). A `Vec` front-drain would
+        // instead memmove the whole remaining buffer down on every row — O(R^2) — which dominates
+        // large reads since servers pack many rows per PartialResultSet.
+        let column_count = metadata.column_types.len();
+        self.ready_rows
+            .reserve(self.buffered_values.len() / column_count);
+        while self.buffered_values.len() >= column_count {
+            // Hold back the final row while its trailing value may still be continued in the next
+            // PartialResultSet (`self.chunked`) and the buffer sits exactly on a row boundary.
             if self.buffered_values.len() == column_count && self.chunked {
                 break;
             }
