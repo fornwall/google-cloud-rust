@@ -149,6 +149,32 @@ impl Type {
         self.0.struct_type.as_deref()
     }
 
+    /// Returns the fully qualified name of the proto or enum definition, or an
+    /// empty string if this type is neither `PROTO` nor `ENUM`.
+    ///
+    /// When `code() == TypeCode::Enum` or `code() == TypeCode::Proto`, this is
+    /// the fully qualified name of the proto message or enum type (for example
+    /// `my.package.MyEnum`). For an `ENUM` column it identifies *which* enum the
+    /// integer ordinals in the result set belong to. Note that the ordinal →
+    /// member-name mapping itself is not carried in query result metadata; it
+    /// lives in the database's proto descriptor bundle and must be resolved out
+    /// of band (e.g. via the admin `GetDatabaseDdl` `proto_descriptors`).
+    pub fn proto_type_fqn(&self) -> &str {
+        &self.0.proto_type_fqn
+    }
+
+    /// Returns the [`TypeAnnotationCode`] that disambiguates the SQL type used to
+    /// represent values of this type.
+    ///
+    /// This is `TypeAnnotationCode::Unspecified` for most types; it is set for
+    /// the PostgreSQL-dialect variants (for example `PgNumeric`, `PgJsonb`,
+    /// `PgOid`) where a single [`TypeCode`] maps to different SQL types depending
+    /// on the dialect. It does not affect value serialization and can be ignored
+    /// on the read path.
+    pub fn type_annotation(&self) -> TypeAnnotationCode {
+        self.0.type_annotation.clone()
+    }
+
     /// Safely reinterprets a reference to the inner model type as a reference to Type.
     /// Logical safety is guaranteed by #[repr(transparent)].
     pub(crate) fn from_ref(v: &model::Type) -> &Self {
@@ -443,6 +469,30 @@ mod tests {
         assert_eq!(int64().array_element_type(), None);
         assert_eq!(string().array_element_type(), None);
         assert_eq!(Type::default().array_element_type(), None);
+    }
+
+    #[test]
+    fn test_proto_type_fqn() {
+        // Non-enum / non-proto types have an empty fully qualified name.
+        assert_eq!(int64().proto_type_fqn(), "");
+        assert_eq!(Type::default().proto_type_fqn(), "");
+
+        // An ENUM type carries the fully qualified enum name.
+        let mut t = create_type(TypeCode::Enum);
+        t.0.proto_type_fqn = "my.package.MyEnum".to_string();
+        assert_eq!(t.code(), TypeCode::Enum);
+        assert_eq!(t.proto_type_fqn(), "my.package.MyEnum");
+    }
+
+    #[test]
+    fn test_type_annotation() {
+        assert_eq!(int64().type_annotation(), TypeAnnotationCode::Unspecified);
+        assert_eq!(
+            pg_numeric().type_annotation(),
+            TypeAnnotationCode::PgNumeric
+        );
+        assert_eq!(pg_jsonb().type_annotation(), TypeAnnotationCode::PgJsonb);
+        assert_eq!(pg_oid().type_annotation(), TypeAnnotationCode::PgOid);
     }
 
     #[test]
