@@ -149,6 +149,20 @@ impl Type {
         self.0.struct_type.as_deref()
     }
 
+    /// Returns the fully qualified name of the proto or enum definition, or an
+    /// empty string if this type is neither `PROTO` nor `ENUM`.
+    ///
+    /// When `code() == TypeCode::Enum` or `code() == TypeCode::Proto`, this is
+    /// the fully qualified name of the proto message or enum type (for example
+    /// `my.package.MyEnum`). For an `ENUM` column it identifies *which* enum the
+    /// integer ordinals in the result set belong to. Note that the ordinal →
+    /// member-name mapping itself is not carried in query result metadata; it
+    /// lives in the database's proto descriptor bundle and must be resolved out
+    /// of band (e.g. via the admin `GetDatabaseDdl` `proto_descriptors`).
+    pub fn proto_type_fqn(&self) -> &str {
+        &self.0.proto_type_fqn
+    }
+
     /// Safely reinterprets a reference to the inner model type as a reference to Type.
     /// Logical safety is guaranteed by #[repr(transparent)].
     pub(crate) fn from_ref(v: &model::Type) -> &Self {
@@ -443,6 +457,19 @@ mod tests {
         assert_eq!(int64().array_element_type(), None);
         assert_eq!(string().array_element_type(), None);
         assert_eq!(Type::default().array_element_type(), None);
+    }
+
+    #[test]
+    fn test_proto_type_fqn() {
+        // Non-enum / non-proto types have an empty fully qualified name.
+        assert_eq!(int64().proto_type_fqn(), "");
+        assert_eq!(Type::default().proto_type_fqn(), "");
+
+        // An ENUM type carries the fully qualified enum name.
+        let mut t = create_type(TypeCode::Enum);
+        t.0.proto_type_fqn = "my.package.MyEnum".to_string();
+        assert_eq!(t.code(), TypeCode::Enum);
+        assert_eq!(t.proto_type_fqn(), "my.package.MyEnum");
     }
 
     #[test]
