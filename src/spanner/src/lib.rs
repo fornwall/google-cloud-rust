@@ -88,6 +88,7 @@ pub(crate) mod result_set_metadata;
 pub(crate) mod row;
 pub(crate) mod server_streaming;
 pub(crate) mod session_maintainer;
+pub(crate) mod statement_based_transaction;
 pub(crate) mod timestamp_bound;
 pub(crate) mod to_value;
 pub(crate) mod transaction_retry_policy;

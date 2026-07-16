@@ -174,6 +174,38 @@ impl DatabaseClient {
         crate::transaction_runner::TransactionRunnerBuilder::new(self.clone())
     }
 
+    /// Returns a builder for a statement-based read-write transaction.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_spanner::client::Spanner;
+    /// # use google_cloud_spanner::statement::Statement;
+    /// # async fn build(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let mut transaction = db_client.statement_based_read_write_transaction().build().await?;
+    /// let statement = Statement::builder("UPDATE users SET active = true WHERE id = 1").build();
+    /// transaction.execute_update(statement).await?;
+    /// transaction.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Unlike [read_write_transaction][DatabaseClient::read_write_transaction],
+    /// which executes the transaction inside a closure and automatically
+    /// retries it when Spanner aborts it, a statement-based transaction gives
+    /// the caller explicit control over the transaction lifecycle. The caller
+    /// decides when to commit or roll back, and is responsible for retrying
+    /// the transaction when it is aborted. See
+    /// [StatementBasedReadWriteTransaction][crate::transaction::StatementBasedReadWriteTransaction]
+    /// for more details.
+    pub fn statement_based_read_write_transaction(
+        &self,
+    ) -> crate::statement_based_transaction::StatementBasedReadWriteTransactionBuilder {
+        crate::statement_based_transaction::StatementBasedReadWriteTransactionBuilder::new(
+            self.clone(),
+        )
+    }
+
     /// Returns a builder for a write-only transaction.
     ///
     /// # Example
