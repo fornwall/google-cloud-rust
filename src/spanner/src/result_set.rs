@@ -77,6 +77,7 @@ pub struct ResultSet {
     safe_to_retry: bool,
     max_buffered_partial_result_sets: usize,
     retry_count: usize,
+    loop_start: std::time::Instant,
     transaction_selector: Option<ReadContextTransactionSelector>,
     channel_hint: usize,
     gax_options: GaxRequestOptions,
@@ -147,6 +148,7 @@ impl ResultSet {
             safe_to_retry: true,
             max_buffered_partial_result_sets: MAX_BUFFERED_PARTIAL_RESULT_SETS,
             retry_count: 0,
+            loop_start: tokio::time::Instant::now().into_std(),
             transaction_selector,
             channel_hint,
             gax_options,
@@ -673,8 +675,9 @@ impl ResultSet {
 
     fn check_retry(&self, e: crate::Error) -> Result<(), crate::Error> {
         if let Some(policy) = self.gax_options.retry_policy() {
-            let state =
-                RetryState::new(self.safe_to_retry).set_attempt_count(self.retry_count as u32);
+            let state = RetryState::new(self.safe_to_retry)
+                .set_attempt_count(self.retry_count as u32)
+                .set_start(self.loop_start);
 
             match policy.on_error(&state, e) {
                 RetryResult::Continue(_) => return Ok(()),
@@ -2297,6 +2300,72 @@ pub(crate) mod tests {
             err_str.contains("Unavailable error"),
             "Expected error to contain 'Unavailable error', but got '{}'",
             err_str
+        );
+
+        Ok(())
+    }
+
+    #[tokio_test_no_panics]
+    async fn test_result_set_retry_elapsed_time_limit() -> anyhow::Result<()> {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_seen = attempts.clone();
+
+        let mut mock = MockSpanner::new();
+        mock.expect_execute_streaming_sql()
+            .returning(move |_request| {
+                attempts_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let stream = adapt([Err(Status::unavailable("Unavailable error"))]);
+                Ok(Response::from(stream))
+            });
+
+        mock.expect_create_session().returning(|_| {
+            Ok(Response::new(Session {
+                name: "session".to_string(),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+
+        let (address, _server) = start("127.0.0.1:0", mock).await?;
+
+        let client: Spanner = Spanner::builder()
+            .with_endpoint(address)
+            .with_credentials(Anonymous::new().build())
+            .build()
+            .await?;
+
+        let db_client = client.database_client("db").build().await?;
+        let tx = db_client.single_use().build();
+
+        // Bound by time, not attempt counts.
+        let attempt_limit = 50;
+        let mut mock_backoff = MockBackoffPolicy::new();
+        mock_backoff
+            .expect_on_failure()
+            .returning(|_| Duration::from_nanos(1));
+
+        let stmt = Statement::builder("SELECT 1")
+            .with_retry_policy(
+                Aip194Strict
+                    .with_attempt_limit(attempt_limit)
+                    .with_time_limit(Duration::from_millis(1)),
+            )
+            .with_backoff_policy(mock_backoff)
+            .build();
+        let res = tx.execute_query(stmt).await;
+
+        assert!(res.is_err(), "Expected an error but got Ok");
+        let err_str = res.expect_err("Expected should be an error").to_string();
+        assert!(
+            err_str.contains("Unavailable error"),
+            "Expected error to contain 'Unavailable error', but got '{}'",
+            err_str
+        );
+        let total_attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            total_attempts < attempt_limit as usize,
+            "Expected the elapsed-time limit to stop retrying well before the attempt limit \
+             of {attempt_limit}, but made {total_attempts} attempts",
         );
 
         Ok(())
