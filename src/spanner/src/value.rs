@@ -151,8 +151,13 @@ impl Value {
             Some(prost_types::value::Kind::NumberValue(n)) => {
                 if let Some(num) = serde_json::Number::from_f64(n) {
                     serde_json::Value::Number(num)
+                } else if n.is_nan() {
+                    // Spanner encodes non-finite FLOAT32/FLOAT64 as these strings.
+                    serde_json::Value::String("NaN".to_string())
+                } else if n > 0.0 {
+                    serde_json::Value::String("Infinity".to_string())
                 } else {
-                    serde_json::Value::Null
+                    serde_json::Value::String("-Infinity".to_string())
                 }
             }
             Some(prost_types::value::Kind::StringValue(s)) => serde_json::Value::String(s),
@@ -305,6 +310,35 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("a").unwrap().try_as_f64(), Some(1.0));
         assert_eq!(v_struct.as_struct().len(), 1);
+    }
+
+    #[test]
+    fn test_non_finite_floats_serialize_as_strings() {
+        use crate::from_value::FromValue;
+        use crate::to_value::ToValue;
+
+        let float64 = crate::types::float64();
+
+        for (input, encoded) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            // Write path: non-finite floats must not collapse to JSON null.
+            let json = input.to_value().into_serde_value();
+            assert_eq!(json, serde_json::Value::String(encoded.to_string()));
+
+            // Read path: the same strings parse back to the original value.
+            let value = Value(ProtoValue {
+                kind: Some(prost_types::value::Kind::StringValue(encoded.to_string())),
+            });
+            let out = f64::from_value(&value, &float64).unwrap();
+            if input.is_nan() {
+                assert!(out.is_nan());
+            } else {
+                assert_eq!(out, input);
+            }
+        }
     }
 
     #[test]

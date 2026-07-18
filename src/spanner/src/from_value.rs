@@ -92,7 +92,7 @@ impl FromValue for Value {
 /// | `NullValue` | `null` |
 /// | `BoolValue` | `true` / `false` |
 /// | `NumberValue` (finite) | JSON number |
-/// | `NumberValue` (NaN/±Infinity) | `null` (matches SDK's `into_serde_value`) |
+/// | `NumberValue` (NaN/±Infinity) | `null` (JSON has no non-finite representation) |
 /// | `StringValue` (standard) | JSON string (includes stringified `INT64`, `NUMERIC`, Base64 `BYTES`, `TIMESTAMP`, `DATE`) |
 /// | `StringValue` (+ `TypeCode::Json`) | Parsed JSON object/array/value |
 /// | `ListValue` + `TypeCode::Struct` | JSON object (positional → named via metadata) |
