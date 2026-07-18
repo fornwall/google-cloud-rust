@@ -20,8 +20,10 @@ use crate::model::{
 };
 use crate::server_streaming::builder;
 use gaxi::options::{ClientConfig, Credentials};
+use google_cloud_auth::credentials::Builder as CredentialsBuilder;
 use google_cloud_auth::credentials::anonymous;
 use google_cloud_gax::client_builder::ClientBuilder as GaxClientBuilder;
+use google_cloud_gax::client_builder::Error as BuilderError;
 use google_cloud_gax::client_builder::internal::new_builder;
 use google_cloud_gax::options::{
     RequestOptions as GaxRequestOptions, internal::RequestOptionsExt as _,
@@ -76,11 +78,26 @@ impl google_cloud_gax::client_builder::internal::ClientFactory for Factory {
             }
         }
 
+        // Resolve the default credential once, so all channels share a single
+        // credential instance (and therefore one token cache and one cached
+        // universe-domain lookup). Otherwise each channel would build its own
+        // credential and repeat the metadata-server universe-domain fetch.
+        if config.cred.is_none() {
+            config.cred = Some(
+                CredentialsBuilder::default()
+                    .build()
+                    .map_err(BuilderError::cred)?,
+            );
+        }
+
         let num_channels = std::env::var("SPANNER_NUM_CHANNELS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4);
 
+        // Channels are created serially on purpose: the first channel resolves
+        // and caches the universe-domain on the shared credential, so the rest
+        // hit that cache instead of each issuing its own metadata-server fetch.
         let mut channels = Vec::with_capacity(num_channels);
         for _ in 0..num_channels {
             channels.push(Channel::create(&config).await?);
