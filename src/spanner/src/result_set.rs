@@ -61,6 +61,9 @@ pub struct ResultSet {
     buffered_values: VecDeque<prost_types::Value>,
     chunked: bool,
     seen_last: bool,
+    // Set once `next()` has surfaced a terminal error. Latches the result set so
+    // subsequent calls return `None` instead of resurrecting buffered rows.
+    terminated: bool,
     ready_rows: VecDeque<Row>,
     local_metadata: Option<ResultSetMetadata>,
     stats: Option<ResultSetStats>,
@@ -134,6 +137,7 @@ impl ResultSet {
             buffered_values: VecDeque::new(),
             chunked: false,
             seen_last: false,
+            terminated: false,
             ready_rows: VecDeque::new(),
             local_metadata: None,
             stats: None,
@@ -295,6 +299,12 @@ impl ResultSet {
     /// Returns `None` when all rows have been retrieved.
     pub async fn next(&mut self) -> Option<crate::Result<Row>> {
         loop {
+            // A previously surfaced error is terminal: never poll the (now dead)
+            // stream again, which would flush buffered rows as a clean end.
+            if self.terminated {
+                return None;
+            }
+
             if let Some(row) = self.ready_rows.pop_front() {
                 return Some(Ok(row));
             }
@@ -316,18 +326,18 @@ impl ResultSet {
             match stream_result {
                 Some(Ok(partial_result_set)) => {
                     if let Err(e) = self.handle_partial_result_set(partial_result_set) {
-                        return Some(Err(e));
+                        return Some(Err(self.latch_terminal(e)));
                     }
                 }
                 Some(Err(e)) => {
                     if let Err(err) = self.handle_stream_error(e).await {
-                        return Some(Err(err));
+                        return Some(Err(self.latch_terminal(err)));
                     }
                 }
                 None => match self.handle_stream_end() {
                     Ok(Some(row)) => return Some(Ok(row)),
                     Ok(None) => return None,
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => return Some(Err(self.latch_terminal(e))),
                 },
             }
         }
@@ -521,6 +531,16 @@ impl ResultSet {
         self.partial_result_sets_buffer.clear();
         self.restart_stream().await?;
         Ok(())
+    }
+
+    /// Marks the result set terminal after a fatal error, dropping the dead
+    /// stream and any buffered (unconfirmed) rows. Returns the error unchanged
+    /// for convenient use at the `return Some(Err(..))` sites.
+    fn latch_terminal(&mut self, e: crate::Error) -> crate::Error {
+        self.terminated = true;
+        self.stream = None;
+        self.partial_result_sets_buffer.clear();
+        e
     }
 
     fn handle_stream_end(&mut self) -> crate::Result<Option<Row>> {
@@ -2249,6 +2269,79 @@ pub(crate) mod tests {
         // The retry stream returns "row1_retry".
         let row1 = rs.next().await.expect("Expected row1")?;
         assert_eq!(row1.raw_values()[0].0, string_val("row1_retry"));
+
+        Ok(())
+    }
+
+    // Regression test: after `next()` surfaces a fatal (non-retryable) stream
+    // error, subsequent calls must return `None`. Otherwise the dead stream is
+    // polled again, reports EOF, and the buffered (unconfirmed) rows get flushed
+    // as a clean completion, masquerading an aborted scan as success.
+    #[tokio_test_no_panics]
+    async fn test_result_set_error_is_terminal() -> anyhow::Result<()> {
+        let mut mock = MockSpanner::new();
+
+        // A single stream: a confirmed row, an unconfirmed (no resume token)
+        // buffered row, then a permanent error. No retry is attempted.
+        mock.expect_execute_streaming_sql()
+            .times(1)
+            .returning(|_request| {
+                let stream = adapt([
+                    Ok(PartialResultSet {
+                        metadata: metadata(1),
+                        values: vec![string_val("row1")],
+                        resume_token: b"token1".to_vec(),
+                        ..Default::default()
+                    }),
+                    Ok(PartialResultSet {
+                        values: vec![string_val("row2")],
+                        ..Default::default()
+                    }),
+                    Err(Status::internal("fatal error")),
+                ]);
+                Ok(Response::from(stream))
+            });
+
+        mock.expect_create_session().returning(|_| {
+            Ok(Response::new(Session {
+                name: "session".to_string(),
+                multiplexed: true,
+                ..Default::default()
+            }))
+        });
+
+        let (address, _server) = start("127.0.0.1:0", mock).await?;
+
+        let client: Spanner = Spanner::builder()
+            .with_endpoint(address)
+            .with_credentials(Anonymous::new().build())
+            .build()
+            .await?;
+
+        let db_client = client.database_client("db").build().await?;
+        let tx = db_client.single_use().build();
+        let mut rs = tx.execute_query("SELECT 1").await?;
+
+        // First row is the confirmed row.
+        let row1 = rs.next().await.expect("Expected row1")?;
+        assert_eq!(row1.raw_values()[0].0, string_val("row1"));
+
+        // The buffered row2 is followed by the fatal error, which must surface.
+        let err = rs
+            .next()
+            .await
+            .expect("Expected an error")
+            .expect_err("Expected an error");
+        assert!(
+            err.to_string().contains("fatal error"),
+            "Expected the fatal error, got '{err}'"
+        );
+
+        // The error is terminal: no clean-looking end that resurrects row2.
+        assert!(
+            rs.next().await.is_none(),
+            "Expected None after a terminal error, but rows leaked through"
+        );
 
         Ok(())
     }
