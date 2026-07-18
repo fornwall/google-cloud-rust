@@ -1073,6 +1073,24 @@ fn merge_request_options(
 /// Helper macro to execute a streaming SQL or streaming read RPC with retry logic.
 macro_rules! execute_stream_with_retry {
     ($self:expr, $request:ident, $gax_options:ident, $rpc_method:ident, $operation_variant:path) => {{
+        let is_starting = matches!(
+            $request
+                .transaction
+                .as_ref()
+                .and_then(|t| t.selector.as_ref()),
+            Some(crate::model::transaction_selector::Selector::Begin(_))
+        );
+
+        // Guard the lazy-begin attempt with the RAII pattern: if this scope exits
+        // before a transaction ID is recorded (send error, protocol error while
+        // reading the first PartialResultSet, or the future being dropped/cancelled),
+        // the guard resets the selector from `Starting` back to `NotStarted` and
+        // unparks any waiters. It is disarmed once the stream yields the ID.
+        let mut start_guard = crate::read_write_transaction::LazyTransactionStartGuard::new(
+            $self.transaction_selector.clone(),
+            is_starting,
+        );
+
         let stream = match $self
             .client
             .spanner
@@ -1082,19 +1100,13 @@ macro_rules! execute_stream_with_retry {
         {
             Ok(s) => s,
             Err(e) => {
-                let is_starting = matches!(
-                    $request
-                        .transaction
-                        .as_ref()
-                        .and_then(|t| t.selector.as_ref()),
-                    Some(crate::model::transaction_selector::Selector::Begin(_))
-                );
                 if is_starting {
                     if $self.transaction_selector.is_read_write() {
                         $self.transaction_selector.set_failed(&e);
                         return Err(e);
                     } else {
                         if is_aborted(&e) {
+                            // Guard resets the `Starting` state on drop.
                             return Err(e);
                         }
                         if $self
@@ -1123,7 +1135,7 @@ macro_rules! execute_stream_with_retry {
             }
         };
 
-        ResultSet::create(ResultSetParams {
+        let result_set = ResultSet::create(ResultSetParams {
             stream,
             transaction_selector: Some($self.transaction_selector.clone()),
             precommit_token_tracker: $self.precommit_token_tracker.clone(),
@@ -1134,7 +1146,11 @@ macro_rules! execute_stream_with_retry {
             channel_hint: $self.channel_hint,
             gax_options: $gax_options,
         })
-        .await
+        .await?;
+        // The stream yielded metadata and (for a begin request) recorded the
+        // transaction ID, so the start attempt succeeded.
+        start_guard.disarm();
+        Ok(result_set)
     }};
 }
 
@@ -2718,6 +2734,85 @@ pub(crate) mod tests {
         let mut rs = tx
             .execute_query(Statement::builder("SELECT 1").build())
             .await?;
+        assert!(rs.next().await.is_some());
+        assert!(rs.next().await.is_none());
+
+        Ok(())
+    }
+
+    // A protocol violation while reading the first PartialResultSet of an
+    // inline-begin query must not leave the transaction stuck in `Starting`.
+    // The RAII guard should reset it to `NotStarted` so later statements can
+    // start the transaction instead of parking forever on the notify latch.
+    #[tokio_test_no_panics]
+    async fn inline_begin_stream_protocol_error_resets_starting() -> anyhow::Result<()> {
+        let mut mock = create_session_mock();
+        let mut seq = mockall::Sequence::new();
+
+        // 1. First inline-begin query yields a PartialResultSet with no metadata,
+        //    which is a protocol violation surfaced while initializing the stream.
+        mock.expect_execute_streaming_sql()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|req| {
+                match req.into_inner().transaction.unwrap().selector.unwrap() {
+                    Selector::Begin(_) => {}
+                    _ => panic!("Expected Selector::Begin"),
+                }
+                Ok(Response::from(adapt([Ok(mock_v1::PartialResultSet {
+                    metadata: None,
+                    ..Default::default()
+                })])))
+            });
+
+        // 2. A subsequent inline-begin query must succeed, proving the transaction
+        //    was not wedged. It should again send Selector::Begin (state reset).
+        mock.expect_execute_streaming_sql()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|req| {
+                match req.into_inner().transaction.unwrap().selector.unwrap() {
+                    Selector::Begin(_) => {}
+                    _ => panic!("Expected Selector::Begin on retry"),
+                }
+                let mut rs = setup_select1();
+                rs.metadata.as_mut().unwrap().transaction = Some(mock_v1::Transaction {
+                    id: vec![4, 5, 6],
+                    ..Default::default()
+                });
+                Ok(Response::from(adapt([Ok(rs)])))
+            });
+
+        let (db_client, _server) = setup_db_client(mock).await;
+        let tx = db_client
+            .read_only_transaction()
+            .with_begin_transaction_option(BeginTransactionOption::InlineBegin)
+            .build()
+            .await?;
+
+        // First query fails with the protocol error.
+        let err = tx
+            .execute_query(Statement::builder("SELECT 1").build())
+            .await
+            .expect_err("Expected a protocol error");
+        assert!(
+            err.to_string().contains("did not contain metadata"),
+            "unexpected error: {err}"
+        );
+
+        // The guard must have reset the selector out of `Starting`.
+        assert!(
+            !tx.context.transaction_selector.is_starting()?,
+            "selector should not be stuck in Starting after a dropped begin attempt"
+        );
+
+        // A follow-up query must not hang; it should re-begin and succeed.
+        let mut rs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tx.execute_query(Statement::builder("SELECT 1").build()),
+        )
+        .await
+        .expect("follow-up query hung: transaction is wedged in Starting")?;
         assert!(rs.next().await.is_some());
         assert!(rs.next().await.is_none());
 
