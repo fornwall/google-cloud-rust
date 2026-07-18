@@ -276,17 +276,17 @@ impl CheckServiceError for ExecuteBatchDmlResponse {
 /// - If the scope exits early due to an error (e.g., aborted error, protocol error, etc.), the guard
 ///   is dropped, and its `Drop` implementation automatically calls `maybe_reset_starting()` to
 ///   restore the selector state and notify waiters.
-struct LazyTransactionStartGuard {
+pub(crate) struct LazyTransactionStartGuard {
     selector: ReadContextTransactionSelector,
     active: bool,
 }
 
 impl LazyTransactionStartGuard {
-    fn new(selector: ReadContextTransactionSelector, active: bool) -> Self {
+    pub(crate) fn new(selector: ReadContextTransactionSelector, active: bool) -> Self {
         Self { selector, active }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.active = false;
     }
 }
