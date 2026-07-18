@@ -256,7 +256,11 @@ impl BatchReadOnlyTransaction {
 /// Defines the segments of data to be read in a partitioned read or query.
 /// These partitions can be serialized and processed across several
 /// different machines or processes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to redact the capability-bearing fields (session
+/// name, transaction id, partition token). `Serialize` is intentionally left
+/// intact, since partitions must be transferable across machines.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Partition {
     pub(crate) inner: PartitionedOperation,
     #[serde(skip)]
@@ -440,10 +444,53 @@ impl Partition {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum PartitionedOperation {
     Query(crate::model::ExecuteSqlRequest),
     Read(crate::model::ReadRequest),
+}
+
+// Hand-written, redacting `Debug` impls. The default derived/generated `Debug`
+// for the wrapped requests prints the session name, transaction id, and
+// partition token verbatim; those are attach-capable capability tokens, so
+// logging a partition with `{:?}` would leak them. Print lengths instead.
+impl std::fmt::Debug for Partition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Partition")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PartitionedOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (operation, session_len, has_transaction, token_len) = match self {
+            PartitionedOperation::Query(req) => (
+                "Query",
+                req.session.len(),
+                req.transaction.is_some(),
+                req.partition_token.len(),
+            ),
+            PartitionedOperation::Read(req) => (
+                "Read",
+                req.session.len(),
+                req.transaction.is_some(),
+                req.partition_token.len(),
+            ),
+        };
+        f.debug_struct("PartitionedOperation")
+            .field("operation", &operation)
+            .field("session", &format_args!("<redacted {session_len} bytes>"))
+            .field(
+                "transaction",
+                &format_args!("<redacted, present={has_transaction}>"),
+            )
+            .field(
+                "partition_token",
+                &format_args!("<redacted {token_len} bytes>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +663,41 @@ pub(crate) mod tests {
             _ => panic!("Expected Read partition"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn debug_redacts_capability_tokens() {
+        let session = "projects/p/instances/i/databases/d/sessions/secret-session-id";
+        let tx_id = b"secret-transaction-id";
+        let token = b"secret-partition-token";
+
+        let req = crate::model::ExecuteSqlRequest::new()
+            .set_session(session)
+            .set_transaction(crate::model::TransactionSelector {
+                selector: Some(Selector::Id(tx_id.to_vec().into())),
+                ..Default::default()
+            })
+            .set_sql("SELECT * FROM Users")
+            .set_partition_token(token.to_vec());
+
+        let partition = Partition {
+            inner: PartitionedOperation::Query(req),
+            gax_options: GaxRequestOptions::default(),
+        };
+
+        let debug = format!("{partition:?}");
+        assert!(!debug.contains(session), "session leaked: {debug}");
+        assert!(
+            !debug.contains("secret-transaction-id"),
+            "tx id leaked: {debug}"
+        );
+        assert!(
+            !debug.contains("secret-partition-token"),
+            "token leaked: {debug}"
+        );
+        // The redacted lengths are still surfaced for debugging.
+        assert!(debug.contains(&format!("<redacted {} bytes>", session.len())));
+        assert!(debug.contains(&format!("<redacted {} bytes>", token.len())));
     }
 
     #[tokio_test_no_panics]
