@@ -369,12 +369,13 @@ impl ResultSet {
         &mut self,
         mut partial_result_set: PartialResultSet,
     ) -> crate::Result<()> {
-        self.precommit_token_tracker.update(
-            partial_result_set
-                .precommit_token
-                .clone()
-                .map(|t| t.cnv().expect("failed to convert precommit token")),
-        );
+        let precommit_token = partial_result_set
+            .precommit_token
+            .clone()
+            .map(|t| t.cnv())
+            .transpose()
+            .map_err(|e| internal_error(format!("failed to convert precommit token: {}", e)))?;
+        self.precommit_token_tracker.update(precommit_token);
 
         if partial_result_set.last {
             self.seen_last = true;
