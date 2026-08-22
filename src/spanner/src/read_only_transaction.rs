@@ -610,7 +610,24 @@ impl ReadContextTransactionSelector {
             Self::Lazy(_) => loop {
                 match self.poll_selector_status()? {
                     SelectorStatus::Ready(selector) => return Ok(selector),
-                    SelectorStatus::Wait(notify) => notify.notified().await,
+                    SelectorStatus::Wait(notify) => {
+                        // `notify_waiters()` stores no permit, so a wakeup landing
+                        // between the unlock in `poll_selector_status` and the first
+                        // poll of `notified` would be lost, hanging the waiter forever.
+                        // Enable the `Notified` future, then re-check the state under the
+                        // lock: if it already resolved we skip the wait, and we only await
+                        // while the same `Starting` epoch we registered against is live.
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        match self.poll_selector_status()? {
+                            SelectorStatus::Ready(selector) => return Ok(selector),
+                            SelectorStatus::Wait(current) if Arc::ptr_eq(&current, &notify) => {
+                                notified.await
+                            }
+                            SelectorStatus::Wait(_) => {}
+                        }
+                    }
                 }
             },
         }
@@ -737,7 +754,21 @@ impl ReadContextTransactionSelector {
         let (options, notify_opt) = match action {
             FallbackAction::None => return Ok(()),
             FallbackAction::Wait(notify) => {
-                notify.notified().await;
+                // Enable the `Notified` future before re-checking the state so a
+                // `notify_waiters()` firing in the unlock window is not lost. Only
+                // wait while the same `Starting` epoch we registered against is live.
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let still_starting = {
+                    let guard = lazy
+                        .lock()
+                        .map_err(|_| internal_error("transaction state mutex poisoned"))?;
+                    matches!(&*guard, TransactionState::Starting(_, n) if Arc::ptr_eq(n, &notify))
+                };
+                if still_starting {
+                    notified.await;
+                }
                 return Ok(());
             }
             FallbackAction::Begin(opts, notif) => (opts, notif),
