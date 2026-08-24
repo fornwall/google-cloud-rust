@@ -19,6 +19,7 @@ pub use crate::read_only_transaction::{
     BeginTransactionOption, MultiUseReadOnlyTransaction, SingleUseReadOnlyTransaction,
 };
 pub use crate::read_write_transaction::ReadWriteTransaction;
+pub use crate::statement_based_transaction::StatementBasedReadWriteTransaction;
 pub use crate::timestamp_bound::TimestampBound;
 pub use crate::transaction_retry_policy::BasicTransactionRetryPolicy;
 pub use crate::transaction_runner::TransactionRunner;
