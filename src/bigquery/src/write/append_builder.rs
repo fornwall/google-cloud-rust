@@ -13,12 +13,10 @@
 // limitations under the License.
 
 use super::append_future::AppendFuture;
-use super::append_response::to_result;
-use super::error::AppendError;
 use super::runner::WriteRequest;
 use crate::Error;
 use crate::model::AppendRowsRequest;
-use gaxi::prost::{FromProto, ToProto};
+use gaxi::prost::ToProto;
 use tokio::sync::{mpsc, oneshot};
 
 /// A request builder for appending rows with a specific stream offset,
@@ -62,8 +60,14 @@ impl AppendWithOffset {
     /// Applications are encouraged to queue up requests and await their
     /// responses independently.
     ///
-    /// Note that the service will reject requests with a mismatched offset, so
-    /// requests must be queued in order.
+    /// Note that the service will reject requests with a mismatched offset.
+    /// Each call queues its request before returning, so calls made from a
+    /// single task queue in the order they are made. Calls made concurrently
+    /// from several tasks have no defined order, and the application must
+    /// synchronize them to control the offsets.
+    ///
+    /// Dropping the returned [AppendFuture] does not cancel the request: the
+    /// rows may still be appended to the stream.
     ///
     /// # Example
     ///
@@ -83,29 +87,7 @@ impl AppendWithOffset {
     /// }
     /// ```
     pub fn send(self) -> AppendFuture {
-        let (tx, rx) = oneshot::channel();
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let req = match self.req.to_proto().map_err(Error::deser) {
-            Ok(req) => req,
-            Err(e) => {
-                let _ = tx.send(Err(e.into()));
-                return AppendFuture::new(rx);
-            }
-        };
-        let write = WriteRequest { req, resp_tx };
-        let _ = self.req_tx.send(write);
-        tokio::spawn(async move {
-            let res = async {
-                let resp = resp_rx
-                    .await
-                    .map_err(|_| AppendError::UnexpectedEndOfStream)??;
-                let resp = resp.cnv().map_err(Error::ser)?;
-                to_result(resp)
-            }
-            .await;
-            let _ = tx.send(res);
-        });
-        AppendFuture::new(rx)
+        queue_append_request(&self.req_tx, self.req)
     }
 }
 
@@ -126,6 +108,13 @@ impl Append {
     /// Applications are encouraged to queue up requests and await their
     /// responses independently.
     ///
+    /// Each call queues its request before returning, so calls made from a
+    /// single task append their rows in the order they are made. Calls made
+    /// concurrently from several tasks have no defined order.
+    ///
+    /// Dropping the returned [AppendFuture] does not cancel the request: the
+    /// rows may still be appended to the stream.
+    ///
     /// # Example
     ///
     /// ```
@@ -144,24 +133,29 @@ impl Append {
     /// }
     /// ```
     pub fn send(self) -> AppendFuture {
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let (resp_tx, resp_rx) = oneshot::channel();
-            let res = async move {
-                let req = self.req.to_proto().map_err(Error::deser)?;
-                let write = WriteRequest { req, resp_tx };
-                let _ = self.req_tx.send(write);
-                let resp = resp_rx
-                    .await
-                    .map_err(|_| AppendError::UnexpectedEndOfStream)??;
-                let resp = resp.cnv().map_err(Error::ser)?;
-                to_result(resp)
-            }
-            .await;
-            let _ = tx.send(res);
-        });
-        AppendFuture::new(rx)
+        queue_append_request(&self.req_tx, self.req)
     }
+}
+
+/// Performs the proto translation for an `AppendRowsRequest`, and queues it for
+/// transmission on the `AppendRows` stream.
+///
+/// The request is placed on the stream's queue before this function returns.
+/// Consecutive calls therefore reach the service in the order the application
+/// made them, as required to write with explicit offsets.
+fn queue_append_request(
+    req_tx: &mpsc::UnboundedSender<WriteRequest>,
+    req: AppendRowsRequest,
+) -> AppendFuture {
+    let req = match req.to_proto() {
+        Ok(req) => req,
+        Err(e) => return AppendFuture::from_error(Error::deser(e).into()),
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    // If the stream has shut down, the response channel is dropped along with
+    // the request, and the future resolves to `UnexpectedEndOfStream`.
+    let _ = req_tx.send(WriteRequest { req, resp_tx });
+    AppendFuture::new(resp_rx)
 }
 
 #[cfg(test)]
@@ -172,6 +166,7 @@ mod tests {
         AppendResult, Response,
     };
     use crate::model::TableSchema;
+    use crate::write::error::AppendError;
 
     #[tokio::test]
     async fn success() -> anyhow::Result<()> {
@@ -179,7 +174,7 @@ mod tests {
         let req = AppendRowsRequest::new().set_write_stream(write_stream());
 
         let builder = Append::new(req_tx, req);
-        let handle = tokio::spawn(async move { builder.send().await });
+        let future = builder.send();
 
         // Receive and verify the request
         let write = req_rx.recv().await.expect("should receive request");
@@ -197,7 +192,7 @@ mod tests {
             .send(Ok(resp))
             .expect("sending on channel always succeeds");
 
-        let resp = handle.await??;
+        let resp = future.await?;
         assert_eq!(resp.offset, None);
         assert_eq!(resp.updated_schema, Some(TableSchema::default()));
         Ok(())
@@ -209,12 +204,12 @@ mod tests {
         let req = AppendRowsRequest::new().set_write_stream(write_stream());
 
         let builder = Append::new(req_tx, req);
-        let handle = tokio::spawn(async move { builder.send().await });
+        let future = builder.send();
 
         // Simulate a stream closure
         drop(req_rx);
 
-        let err = handle.await?.expect_err("should return an error");
+        let err = future.await.expect_err("should return an error");
         assert!(matches!(err, AppendError::UnexpectedEndOfStream));
         Ok(())
     }
@@ -225,7 +220,7 @@ mod tests {
         let req = AppendRowsRequest::new().set_write_stream(write_stream());
 
         let builder = Append::new(req_tx, req);
-        let handle = tokio::spawn(async move { builder.send().await });
+        let future = builder.send();
 
         // Simulate a stream ending in a known error
         let write = req_rx.recv().await.expect("should receive request");
@@ -235,7 +230,7 @@ mod tests {
             .send(Err(append_err))
             .expect("sending on channel always succeeds");
 
-        let err = handle.await?.expect_err("should return an error");
+        let err = future.await.expect_err("should return an error");
         assert!(matches!(err, AppendError::Rpc { source: _ }));
         Ok(())
     }
@@ -246,7 +241,7 @@ mod tests {
         let req = AppendRowsRequest::new().set_write_stream(write_stream());
 
         let builder = Append::new(req_tx, req);
-        let handle = tokio::spawn(async move { builder.send().await });
+        let future = builder.send();
 
         let write = req_rx.recv().await.expect("should receive request");
 
@@ -265,8 +260,55 @@ mod tests {
             .send(Ok(resp))
             .expect("sending on channel always succeeds");
 
-        let err = handle.await?.expect_err("should return an error");
+        let err = future.await.expect_err("should return an error");
         assert!(matches!(err, AppendError::RowErrors(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn queued_before_send_returns() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let req = AppendRowsRequest::new().set_write_stream(write_stream());
+
+        // Note that the future is never polled, and that this is not a
+        // `#[tokio::test]`: `send()` must not need an ambient runtime.
+        let _future = Append::new(req_tx, req).send();
+
+        let write = req_rx.try_recv().expect("request should already be queued");
+        assert_eq!(write.req.write_stream, write_stream());
+    }
+
+    #[test]
+    fn dropped_future_keeps_request_queued() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let req = AppendRowsRequest::new().set_write_stream(write_stream());
+
+        // Dropping the future cannot withdraw the request. The service
+        // correlates its responses by position on the stream.
+        drop(Append::new(req_tx, req).send());
+
+        let write = req_rx.try_recv().expect("request should still be queued");
+        assert_eq!(write.req.write_stream, write_stream());
+
+        // The runner ignores the error from the abandoned response channel.
+        let resp = v1::AppendRowsResponse::default();
+        assert!(write.resp_tx.send(Ok(resp)).is_err(), "receiver is gone");
+    }
+
+    #[tokio::test]
+    async fn conversion_error() -> anyhow::Result<()> {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+
+        // Keep a sender alive, so that an empty queue reads as empty rather
+        // than as disconnected.
+        let future = Append::new(req_tx.clone(), unconvertible_request()).send();
+
+        // A request we cannot convert must not take a place on the stream.
+        let err = req_rx.try_recv().expect_err("nothing should be queued");
+        assert!(matches!(err, mpsc::error::TryRecvError::Empty));
+
+        let err = future.await.expect_err("should return an error");
+        assert!(matches!(err, AppendError::Rpc { source: _ }));
         Ok(())
     }
 
@@ -364,6 +406,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn offset_queued_before_send_returns() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let req = AppendRowsRequest::new().set_write_stream(write_stream());
+
+        // Note that the future is never polled, and that this is not a
+        // `#[tokio::test]`: `send()` must not need an ambient runtime.
+        let _future = AppendWithOffset::new(req_tx, req).set_offset(100).send();
+
+        let write = req_rx.try_recv().expect("request should already be queued");
+        assert_eq!(write.req.offset, Some(100));
+    }
+
+    #[test]
+    fn offset_dropped_future_keeps_request_queued() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let req = AppendRowsRequest::new().set_write_stream(write_stream());
+
+        // Dropping the future cannot withdraw the request. The service
+        // correlates its responses by position on the stream.
+        drop(AppendWithOffset::new(req_tx, req).set_offset(100).send());
+
+        let write = req_rx.try_recv().expect("request should still be queued");
+        assert_eq!(write.req.offset, Some(100));
+
+        // The runner ignores the error from the abandoned response channel.
+        let resp = v1::AppendRowsResponse::default();
+        assert!(write.resp_tx.send(Ok(resp)).is_err(), "receiver is gone");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn synchronous_queueing() -> anyhow::Result<()> {
         const NUM_WRITES: i64 = 1000;
@@ -386,6 +458,33 @@ mod tests {
         }
         write_handle.await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn offset_conversion_error() -> anyhow::Result<()> {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+
+        // Keep a sender alive, so that an empty queue reads as empty rather
+        // than as disconnected.
+        let future = AppendWithOffset::new(req_tx.clone(), unconvertible_request())
+            .set_offset(100)
+            .send();
+
+        // A request we cannot convert must not take a place on the stream.
+        let err = req_rx.try_recv().expect_err("nothing should be queued");
+        assert!(matches!(err, mpsc::error::TryRecvError::Empty));
+
+        let err = future.await.expect_err("should return an error");
+        assert!(matches!(err, AppendError::Rpc { source: _ }));
+        Ok(())
+    }
+
+    /// A request the client library cannot convert to its proto representation.
+    /// An enum value it does not know has no integer to put on the wire.
+    fn unconvertible_request() -> AppendRowsRequest {
+        AppendRowsRequest::new()
+            .set_write_stream(write_stream())
+            .set_default_missing_value_interpretation("NOT_A_MISSING_VALUE_INTERPRETATION")
     }
 
     fn write_stream() -> String {

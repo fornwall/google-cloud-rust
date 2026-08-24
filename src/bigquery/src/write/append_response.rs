@@ -14,8 +14,10 @@
 
 use super::error::{AppendError, AppendResult};
 use crate::Error;
+use crate::google::cloud::bigquery::storage::v1;
 use crate::model::append_rows_response::Response;
 use crate::model::{AppendRowsResponse, TableSchema};
+use gaxi::prost::FromProto;
 
 /// The return type of an `append()` operation.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -36,7 +38,11 @@ pub struct AppendResponse {
     pub updated_schema: Option<TableSchema>,
 }
 
-pub(crate) fn to_result(resp: AppendRowsResponse) -> AppendResult<AppendResponse> {
+pub(crate) fn proto_to_result(resp: v1::AppendRowsResponse) -> AppendResult<AppendResponse> {
+    to_result(resp.cnv().map_err(Error::ser)?)
+}
+
+fn to_result(resp: AppendRowsResponse) -> AppendResult<AppendResponse> {
     if !resp.row_errors.is_empty() {
         return Err(AppendError::RowErrors(resp.row_errors));
     }
