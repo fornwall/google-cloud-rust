@@ -340,9 +340,16 @@ mod tests {
             .await
             .expect_err("should return an error");
 
-        assert_eq!(
-            err.status().expect("should have a status").code,
-            Code::FailedPrecondition
+        let status = err.status().expect("should have a status");
+        assert_eq!(status.code, Code::FailedPrecondition);
+        // The detail survives on the status itself, not just through the
+        // accessor below.
+        assert!(
+            matches!(
+                status.details.as_slice(),
+                [google_cloud_gax::error::rpc::StatusDetails::Other(_)]
+            ),
+            "{status:?}"
         );
         let got = err
             .storage_error()

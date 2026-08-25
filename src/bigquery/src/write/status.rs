@@ -14,48 +14,29 @@
 
 use crate::google;
 use crate::model::StorageError;
+use gaxi::grpc::status::{
+    DetailConverter, DetailConverters, any_from_prost_with, any_to_prost_with,
+};
 use gaxi::prost::FromProto;
 use gaxi::prost::ToProto;
 use google_cloud_rpc::model::Status;
-use wkt::message::Message;
 
-/// Converts one detail of a `google.rpc.Status` to its idiomatic form.
+/// The status detail types the Storage Write API adds to the standard
+/// `google.rpc.*` ones.
 ///
-/// The BigQuery Storage Write API attaches a [StorageError] to the status
-/// describing a failure. It is the only way to distinguish, say, a schema
-/// mismatch from any other malformed request. `gaxi` only knows the standard
-/// `google.rpc.*` detail types, so handle this one here and delegate the rest
-/// back to it.
+/// The service reports most failures with a generic canonical code, such as
+/// `INVALID_ARGUMENT`, and attaches a [StorageError] to the status with the
+/// actual reason. `gaxi` only knows the standard detail types and drops
+/// everything else, so declare this one here.
 ///
-/// This converts the status on an `AppendRows` response. Statuses that arrive
-/// as a `tonic::Status` never reach this function: `gaxi` has already dropped
-/// the detail by then, so
-/// [StorageWriteErrorExt::storage_error][crate::write::error::StorageWriteErrorExt::storage_error]
-/// decodes the wire status and picks out the detail itself.
-fn any_from_prost(value: prost_types::Any) -> Option<wkt::Any> {
-    if value.type_url == StorageError::typename() {
-        return value
-            .to_msg::<google::cloud::bigquery::storage::v1::StorageError>()
-            .ok()
-            .and_then(|v| v.cnv().ok())
-            .and_then(|v| wkt::Any::from_msg(&v).ok());
-    }
-    gaxi::grpc::status::any_from_prost(value)
-}
-
-/// Converts the details of a [Status] to their wire form.
-///
-/// The inverse of [any_from_prost].
-fn any_to_prost(value: wkt::Any) -> Option<prost_types::Any> {
-    if value.type_url() == Some(StorageError::typename()) {
-        return value
-            .to_msg::<StorageError>()
-            .ok()
-            .and_then(|v| v.to_proto().ok())
-            .and_then(|v| prost_types::Any::from_msg(&v).ok());
-    }
-    gaxi::grpc::status::any_to_prost(value)
-}
+/// [Transport::create][crate::write::transport::Transport::create] installs
+/// this as a `ClientConfig` extension, which covers every status arriving as a
+/// `tonic::Status`. The conversions below cover the statuses embedded in an
+/// `AppendRowsResponse`, which the transport never sees.
+pub(crate) const CONVERTERS: DetailConverters = DetailConverters(&[DetailConverter::new::<
+    google::cloud::bigquery::storage::v1::StorageError,
+    StorageError,
+>()]);
 
 impl ToProto<google::rpc::Status> for Status {
     type Output = google::rpc::Status;
@@ -63,7 +44,11 @@ impl ToProto<google::rpc::Status> for Status {
         Ok(google::rpc::Status {
             code: self.code,
             message: self.message.to_string(),
-            details: self.details.into_iter().filter_map(any_to_prost).collect(),
+            details: self
+                .details
+                .into_iter()
+                .filter_map(|d| any_to_prost_with(&d, CONVERTERS))
+                .collect(),
         })
     }
 }
@@ -76,7 +61,7 @@ impl FromProto<Status> for google::rpc::Status {
         status = status.set_details(
             self.details
                 .into_iter()
-                .filter_map(any_from_prost)
+                .filter_map(|d| any_from_prost_with(&d, CONVERTERS))
                 .collect::<Vec<wkt::Any>>(),
         );
         Ok(status)

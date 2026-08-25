@@ -14,7 +14,8 @@
 
 //! Helper functions for gRPC streaming requests and responses.
 
-use crate::grpc::from_status::to_gax_error;
+use crate::grpc::from_status::to_gax_error_with;
+use crate::grpc::status::DetailConverters;
 use crate::prost::{FromProto, ToProto};
 use futures::FutureExt as _;
 use futures::stream::StreamExt as _;
@@ -63,14 +64,15 @@ where
 /// Decodes a stream of raw Prost results (from Tonic) into a stream of domain model results.
 pub(crate) fn decode_response_stream<DomainResp, ProstResp, S>(
     stream: S,
+    extra: DetailConverters,
 ) -> impl futures::Stream<Item = google_cloud_gax::Result<DomainResp>> + Send + 'static
 where
     S: futures::Stream<Item = std::result::Result<ProstResp, tonic::Status>> + Send + 'static,
     DomainResp: Send + 'static,
     ProstResp: FromProto<DomainResp> + Send + 'static,
 {
-    stream.map(|res| {
-        res.map_err(to_gax_error)
+    stream.map(move |res| {
+        res.map_err(|s| to_gax_error_with(s, extra))
             .and_then(|m| m.cnv().map_err(Error::deser))
     })
 }
@@ -80,13 +82,14 @@ pub(crate) fn create_response_receiver<DomainResp, ProstResp>(
     resp_rx: tokio::sync::oneshot::Receiver<
         google_cloud_gax::Result<tonic::Response<tonic::Streaming<ProstResp>>>,
     >,
+    extra: DetailConverters,
 ) -> ResponseReceiver<DomainResp>
 where
     DomainResp: Send + 'static,
     ProstResp: FromProto<DomainResp> + Send + 'static,
 {
-    let future = resp_rx.map(|res| match res {
-        Ok(Ok(response)) => Ok(decode_response_stream(response.into_inner())),
+    let future = resp_rx.map(move |res| match res {
+        Ok(Ok(response)) => Ok(decode_response_stream(response.into_inner(), extra)),
         Ok(Err(err)) => Err(err),
         Err(_) => Err(Error::io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
@@ -317,7 +320,8 @@ mod tests {
             }),
         ]);
 
-        let mut decoded = decode_response_stream::<MockDomainResp, _, _>(raw_stream);
+        let mut decoded =
+            decode_response_stream::<MockDomainResp, _, _>(raw_stream, DetailConverters::NONE);
 
         let first = decoded
             .next()
@@ -349,7 +353,10 @@ mod tests {
     #[tokio::test]
     async fn decode_response_stream_empty() {
         let raw_stream = futures::stream::empty::<Result<MockProstResp, tonic::Status>>();
-        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(raw_stream);
+        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(
+            raw_stream,
+            DetailConverters::NONE,
+        );
         assert!(decoded.next().await.is_none());
     }
 
@@ -362,7 +369,10 @@ mod tests {
         let raw_stream =
             futures::stream::iter(vec![Err(tonic::Status::new(tonic_code, "status error"))]);
 
-        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(raw_stream);
+        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(
+            raw_stream,
+            DetailConverters::NONE,
+        );
 
         let err = decoded
             .next()
@@ -391,7 +401,10 @@ mod tests {
             Err(tonic::Status::new(tonic_code, "mid-stream error")),
         ]);
 
-        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(raw_stream);
+        let mut decoded = decode_response_stream::<MockDomainResp, MockProstResp, _>(
+            raw_stream,
+            DetailConverters::NONE,
+        );
 
         let first = decoded.next().await.expect("first item").expect("Ok");
         assert_eq!(first.msg, "item1");
@@ -420,7 +433,8 @@ mod tests {
             .collect();
 
         let raw_stream = futures::stream::iter(items);
-        let mut decoded = decode_response_stream::<MockDomainResp, _, _>(raw_stream);
+        let mut decoded =
+            decode_response_stream::<MockDomainResp, _, _>(raw_stream, DetailConverters::NONE);
 
         for i in 0..3 {
             let res = decoded.next().await.expect("item");
@@ -436,7 +450,10 @@ mod tests {
     #[tokio::test]
     async fn create_response_receiver_success_empty() {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(resp_rx);
+        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(
+            resp_rx,
+            DetailConverters::NONE,
+        );
 
         let streaming = tonic::codec::Streaming::new_empty(
             tonic_prost::ProstDecoder::<MockProstResp>::default(),
@@ -454,7 +471,10 @@ mod tests {
     #[tokio::test]
     async fn create_response_receiver_connection_error(code: Code, msg: &'static str) {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(resp_rx);
+        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(
+            resp_rx,
+            DetailConverters::NONE,
+        );
 
         let status = google_cloud_gax::error::rpc::Status::default()
             .set_code(code)
@@ -475,7 +495,10 @@ mod tests {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<
             google_cloud_gax::Result<tonic::Response<tonic::Streaming<MockProstResp>>>,
         >();
-        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(resp_rx);
+        let mut receiver = create_response_receiver::<MockDomainResp, MockProstResp>(
+            resp_rx,
+            DetailConverters::NONE,
+        );
 
         drop(resp_tx); // task cancelled
 
