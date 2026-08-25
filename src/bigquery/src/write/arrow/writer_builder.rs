@@ -301,6 +301,58 @@ mod tests {
         Ok(())
     }
 
+    /// The BigQuery-specific status details survive on the unary RPCs too, not
+    /// just on `AppendRows`.
+    #[tokio::test]
+    async fn pending_storage_error() -> anyhow::Result<()> {
+        use crate::error::StorageWriteErrorExt;
+        use crate::google::cloud::bigquery::storage::v1 as pb;
+        use crate::model::storage_error::StorageErrorCode;
+        use gaxi::grpc::tonic;
+        use google_cloud_gax::error::rpc::Code;
+        use prost::Message;
+
+        let mut mock = MockBigQueryWrite::new();
+        mock.expect_create_write_stream().return_once(|_| {
+            let detail = pb::StorageError {
+                code: pb::storage_error::StorageErrorCode::StreamAlreadyCommitted as i32,
+                entity: "projects/p/datasets/d/tables/t".to_string(),
+                error_message: "the stream is already committed".to_string(),
+            };
+            let status = crate::google::rpc::Status {
+                code: Code::FailedPrecondition as i32,
+                message: "fail".to_string(),
+                details: vec![
+                    prost_types::Any::from_msg(&detail).expect("encoding is always valid."),
+                ],
+            };
+            Err(tonic::Status::with_details(
+                tonic::Code::FailedPrecondition,
+                "fail",
+                status.encode_to_vec().into(),
+            ))
+        });
+        let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
+        let transport = Arc::new(test_transport(endpoint).await?);
+        let builder = WriterBuilder::new(transport, ArrowSchema::new());
+        let err = builder
+            .pending("projects/p/datasets/d/tables/t")
+            .await
+            .expect_err("should return an error");
+
+        assert_eq!(
+            err.status().expect("should have a status").code,
+            Code::FailedPrecondition
+        );
+        let got = err
+            .storage_error()
+            .unwrap_or_else(|| panic!("should preserve the storage error, got {err:?}"));
+        assert_eq!(got.code, StorageErrorCode::StreamAlreadyCommitted);
+        assert_eq!(got.entity, "projects/p/datasets/d/tables/t");
+        assert_eq!(got.error_message, "the stream is already committed");
+        Ok(())
+    }
+
     #[test_case("projects/p")]
     #[test_case("projects/p/tables/t")]
     #[test_case("projects/p/datasets/d/tables/")]
