@@ -21,7 +21,6 @@ use arrow::record_batch::RecordBatch;
 use google_cloud_bigquery::client::Write;
 use google_cloud_bigquery::model::{ArrowRecordBatch, ArrowSchema};
 use std::sync::Arc;
-use tokio::task::JoinSet;
 
 pub async fn sample(project_id: &str, dataset_id: &str, table_id: &str) -> anyhow::Result<()> {
     let client = Write::builder().build().await?;
@@ -40,13 +39,16 @@ pub async fn sample(project_id: &str, dataset_id: &str, table_id: &str) -> anyho
         .arrow(ArrowSchema::new().set_serialized_schema(schema_buf))
         .default(table)?;
 
-    let mut writes = JoinSet::new();
+    // `send()` queues the request, so we can pipeline all the writes and only
+    // then wait for their acknowledgments.
+    let mut writes = Vec::new();
     for i in 0..100 {
         let batch = make_batch(schema.clone(), schema_len, i, 10)?;
-        writes.spawn(writer.append(batch).send());
+        writes.push(writer.append(batch).send());
     }
-    let results: Result<Vec<_>, _> = writes.join_all().await.into_iter().collect();
-    let _ = results?;
+    for write in writes {
+        let _ = write.await?;
+    }
     println!("Successfully wrote 100 record batches of 10 rows each.");
 
     Ok(())
