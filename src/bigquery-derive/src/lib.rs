@@ -133,6 +133,45 @@ pub fn derive_from_sql(input: TokenStream) -> TokenStream {
         }
     });
 
+    let field_initializers_context = fields.iter().map(|f| {
+        let field_name = f.ident.as_ref().expect("named field must have identifier");
+        let db_column_name = get_field_name(f);
+        quote! {
+            #field_name: {
+                let field_index = context.field_index(#db_column_name)
+                    .ok_or_else(|| google_cloud_bigquery::error::ConvertError::MissingField(#db_column_name.to_string()))?;
+                let field_context = context.nested_field(field_index)
+                    .ok_or_else(|| google_cloud_bigquery::error::ConvertError::MissingField(#db_column_name.to_string()))?;
+                let field_value = std::mem::replace(
+                    arr.get_mut(field_index)
+                        .ok_or_else(|| google_cloud_bigquery::error::ConvertError::MissingField(#db_column_name.to_string()))?,
+                    wkt::Value::Null,
+                );
+                google_cloud_bigquery::query::FromSql::from_sql_with_context(
+                    field_value,
+                    &field_context,
+                )?
+            }
+        }
+    });
+
+    let duplicate_checks_context = fields.iter().enumerate().filter_map(|(index, f)| {
+        let db_column_name = get_field_name(f);
+        fields
+            .iter()
+            .take(index)
+            .any(|previous| get_field_name(previous) == db_column_name)
+            .then(|| {
+                quote! {
+                    if context.field_index(#db_column_name).is_some() {
+                        return std::result::Result::Err(
+                            google_cloud_bigquery::error::ConvertError::MissingField(#db_column_name.to_string())
+                        );
+                    }
+                }
+            })
+    });
+
     let expanded = quote! {
         impl google_cloud_bigquery::query::FromSql for #name {
             fn from_sql(value: wkt::Value) -> std::result::Result<Self, google_cloud_bigquery::error::ConvertError> {
@@ -154,6 +193,21 @@ pub fn derive_from_sql(input: TokenStream) -> TokenStream {
                         expected: "array or object",
                         got: other,
                     }),
+                }
+            }
+
+            fn from_sql_with_context(
+                value: wkt::Value,
+                context: &google_cloud_bigquery::query::FromSqlContext<'_>,
+            ) -> std::result::Result<Self, google_cloud_bigquery::error::ConvertError> {
+                match value {
+                    wkt::Value::Array(mut arr) => {
+                        #( #duplicate_checks_context )*
+                        std::result::Result::Ok(Self {
+                            #( #field_initializers_context, )*
+                        })
+                    }
+                    other => Self::from_sql(context.materialize(other)?),
                 }
             }
         }
