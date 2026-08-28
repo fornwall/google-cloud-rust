@@ -13,21 +13,29 @@
 // limitations under the License.
 
 use crate::as_inner::as_inner;
-use crate::grpc::status::status_from_proto;
+use crate::grpc::status::{DetailConverters, status_from_proto};
 use google_cloud_gax::error::Error;
 use google_cloud_gax::error::rpc::Status;
 use prost::Message;
 use std::error::Error as _;
 
-fn to_gax_status(status: &tonic::Status) -> Status {
+fn to_gax_status(status: &tonic::Status, extra: DetailConverters) -> Status {
     let pb = crate::google::rpc::Status::decode(status.details()).unwrap_or_default();
-    status_from_proto(pb)
+    status_from_proto(pb, extra)
         .set_code(status.code())
         .set_message(status.message())
         .into()
 }
 
+/// Converts a `tonic::Status` to an [Error], keeping only the standard
+/// `google.rpc.*` status details.
 pub fn to_gax_error(status: tonic::Status) -> Error {
+    to_gax_error_with(status, DetailConverters::NONE)
+}
+
+/// Converts a `tonic::Status` to an [Error], also keeping the service-specific
+/// status details in `extra`.
+pub fn to_gax_error_with(status: tonic::Status, extra: DetailConverters) -> Error {
     if as_inner::<tonic::TimeoutExpired, _>(&status).is_some() {
         return Error::timeout(status);
     }
@@ -49,7 +57,7 @@ pub fn to_gax_error(status: tonic::Status) -> Error {
         // or the routing headers are bad.
         return Error::transport(headers, GrpcError::BadContentType(status));
     }
-    let gax_status = to_gax_status(&status);
+    let gax_status = to_gax_status(&status, extra);
     Error::service_full(gax_status, None, Some(headers), Some(Box::new(status)))
 }
 
@@ -93,7 +101,10 @@ mod tests {
     #[test_case(tonic::Code::DataLoss, Code::DataLoss)]
     #[test_case(tonic::Code::Unauthenticated, Code::Unauthenticated)]
     fn check_code(input: tonic::Code, want: Code) {
-        let got = to_gax_status(&tonic::Status::new(input, "test-only"));
+        let got = to_gax_status(
+            &tonic::Status::new(input, "test-only"),
+            DetailConverters::NONE,
+        );
         assert_eq!(got.code, want);
         assert_eq!(&got.message, "test-only");
     }
@@ -175,6 +186,60 @@ mod tests {
             fmt.contains("should start with application/grpc"),
             "fmt={fmt}, got={got:?}"
         );
+    }
+
+    /// A detail type this library does not know is dropped by default, and
+    /// kept when the client supplies a converter for it.
+    #[test]
+    fn gax_error_with_extra_details() -> anyhow::Result<()> {
+        use crate::grpc::status::DetailConverter;
+        type ProtoDetail = crate::google::rpc::bad_request::FieldViolation;
+        type ModelDetail = google_cloud_rpc::model::bad_request::FieldViolation;
+        const CONVERTERS: crate::grpc::status::DetailConverters =
+            crate::grpc::status::DetailConverters(&[DetailConverter::new::<
+                ProtoDetail,
+                ModelDetail,
+            >()]);
+
+        #[allow(clippy::needless_update)]
+        let detail = ProtoDetail {
+            field: "field".into(),
+            description: "desc".into(),
+            ..Default::default()
+        };
+        let code = Code::InvalidArgument as i32;
+        let pb = crate::google::rpc::Status {
+            code,
+            message: "test-only".to_string(),
+            details: vec![prost_types::Any::from_msg(&detail)?],
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            http::HeaderValue::from_static("application/grpc"),
+        );
+        let status = || {
+            tonic::Status::with_details_and_metadata(
+                code.into(),
+                "test-only",
+                pb.encode_to_vec().into(),
+                tonic::metadata::MetadataMap::from_headers(headers.clone()),
+            )
+        };
+
+        let got = to_gax_error(status());
+        assert_eq!(got.status().unwrap().details, Vec::new());
+
+        let got = to_gax_error_with(status(), CONVERTERS);
+        assert_eq!(
+            got.status().unwrap().details,
+            vec![StatusDetails::Other(wkt::Any::from_msg(
+                &ModelDetail::new()
+                    .set_field("field")
+                    .set_description("desc")
+            )?)]
+        );
+        Ok(())
     }
 
     #[test]

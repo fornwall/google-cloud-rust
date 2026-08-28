@@ -33,7 +33,7 @@ impl Write {
     }
 
     pub(crate) async fn new(builder: ClientBuilder) -> BuilderResult<Self> {
-        let transport = Transport::new(builder.config).await?;
+        let transport = Transport::create(builder.config).await?;
         Ok(Self {
             inner: Arc::new(transport),
         })

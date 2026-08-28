@@ -172,6 +172,7 @@ mod tests {
         AppendResult, Response,
     };
     use crate::model::TableSchema;
+    use google_cloud_gax::error::rpc::Code;
 
     #[tokio::test]
     async fn success() -> anyhow::Result<()> {
@@ -237,6 +238,47 @@ mod tests {
 
         let err = handle.await?.expect_err("should return an error");
         assert!(matches!(err, AppendError::Rpc { source: _ }));
+        Ok(())
+    }
+
+    /// The service reports a schema mismatch as a `StorageError` attached to
+    /// the status of the append.
+    #[tokio::test]
+    async fn storage_error() -> anyhow::Result<()> {
+        use crate::model::storage_error::StorageErrorCode;
+
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let req = AppendRowsRequest::new().set_write_stream(write_stream());
+
+        let builder = Append::new(req_tx, req);
+        let handle = tokio::spawn(async move { builder.send().await });
+
+        let write = req_rx.recv().await.expect("should receive request");
+
+        let storage_error = v1::StorageError {
+            code: v1::storage_error::StorageErrorCode::SchemaMismatchExtraFields as i32,
+            entity: write_stream(),
+            error_message: "the schema does not match".to_string(),
+        };
+        let resp = v1::AppendRowsResponse {
+            response: Some(Response::Error(crate::google::rpc::Status {
+                code: Code::InvalidArgument as i32,
+                message: "fail".to_string(),
+                details: vec![prost_types::Any::from_msg(&storage_error)?],
+            })),
+            write_stream: write_stream(),
+            ..Default::default()
+        };
+        write
+            .resp_tx
+            .send(Ok(resp))
+            .expect("sending on channel always succeeds");
+
+        let err = handle.await?.expect_err("should return an error");
+        let got = err.storage_error().expect("should have a storage error");
+        assert_eq!(got.code, StorageErrorCode::SchemaMismatchExtraFields);
+        assert_eq!(got.entity, write_stream());
+        assert_eq!(got.error_message, "the schema does not match");
         Ok(())
     }
 

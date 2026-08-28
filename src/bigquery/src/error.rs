@@ -121,6 +121,7 @@ pub enum ConvertError {
 // TODO(#6443) - consolidate crates
 pub use crate::write::error::AppendError;
 pub use crate::write::error::AttachError;
+pub use crate::write::error::StorageWriteErrorExt;
 
 #[cfg(test)]
 mod tests {

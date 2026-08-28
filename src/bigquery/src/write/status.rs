@@ -13,9 +13,30 @@
 // limitations under the License.
 
 use crate::google;
+use crate::model::StorageError;
+use gaxi::grpc::status::{
+    DetailConverter, DetailConverters, any_from_prost_with, any_to_prost_with,
+};
 use gaxi::prost::FromProto;
 use gaxi::prost::ToProto;
 use google_cloud_rpc::model::Status;
+
+/// The status detail types the Storage Write API adds to the standard
+/// `google.rpc.*` ones.
+///
+/// The service reports most failures with a generic canonical code, such as
+/// `INVALID_ARGUMENT`, and attaches a [StorageError] to the status with the
+/// actual reason. `gaxi` only knows the standard detail types and drops
+/// everything else, so declare this one here.
+///
+/// [Transport::create][crate::write::transport::Transport::create] installs
+/// this as a `ClientConfig` extension, which covers every status arriving as a
+/// `tonic::Status`. The conversions below cover the statuses embedded in an
+/// `AppendRowsResponse`, which the transport never sees.
+pub(crate) const CONVERTERS: DetailConverters = DetailConverters(&[DetailConverter::new::<
+    google::cloud::bigquery::storage::v1::StorageError,
+    StorageError,
+>()]);
 
 impl ToProto<google::rpc::Status> for Status {
     type Output = google::rpc::Status;
@@ -26,7 +47,7 @@ impl ToProto<google::rpc::Status> for Status {
             details: self
                 .details
                 .into_iter()
-                .filter_map(gaxi::grpc::status::any_to_prost)
+                .filter_map(|d| any_to_prost_with(&d, CONVERTERS))
                 .collect(),
         })
     }
@@ -40,7 +61,7 @@ impl FromProto<Status> for google::rpc::Status {
         status = status.set_details(
             self.details
                 .into_iter()
-                .filter_map(gaxi::grpc::status::any_from_prost)
+                .filter_map(|d| any_from_prost_with(&d, CONVERTERS))
                 .collect::<Vec<wkt::Any>>(),
         );
         Ok(status)
@@ -74,6 +95,99 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(got, want);
+        Ok(())
+    }
+
+    fn prost_storage_error() -> google::cloud::bigquery::storage::v1::StorageError {
+        use google::cloud::bigquery::storage::v1::storage_error::StorageErrorCode;
+        google::cloud::bigquery::storage::v1::StorageError {
+            code: StorageErrorCode::SchemaMismatchExtraFields as i32,
+            entity: "projects/p/datasets/d/tables/t".into(),
+            error_message: "the schema does not match".into(),
+        }
+    }
+
+    fn storage_error() -> StorageError {
+        use crate::model::storage_error::StorageErrorCode;
+        StorageError::new()
+            .set_code(StorageErrorCode::SchemaMismatchExtraFields)
+            .set_entity("projects/p/datasets/d/tables/t")
+            .set_error_message("the schema does not match")
+    }
+
+    #[test]
+    fn from_proto_storage_error() -> anyhow::Result<()> {
+        let input = google::rpc::Status {
+            code: 3,
+            message: "test-message".into(),
+            details: vec![prost_types::Any::from_msg(&prost_storage_error())?],
+        };
+        let got = input.cnv()?;
+        let want = Status::new()
+            .set_code(3)
+            .set_message("test-message")
+            .set_details([wkt::Any::from_msg(&storage_error())?]);
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn to_proto_storage_error() -> anyhow::Result<()> {
+        let input = Status::new()
+            .set_code(3)
+            .set_message("test-message")
+            .set_details([wkt::Any::from_msg(&storage_error())?]);
+        let got: google::rpc::Status = input.to_proto()?;
+        let want = google::rpc::Status {
+            code: 3,
+            message: "test-message".into(),
+            details: vec![prost_types::Any::from_msg(&prost_storage_error())?],
+        };
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    /// The standard `google.rpc.*` details are still converted by `gaxi`.
+    #[test]
+    fn standard_details_round_trip() -> anyhow::Result<()> {
+        use google_cloud_rpc::model::DebugInfo;
+        let want = Status::new()
+            .set_code(3)
+            .set_message("test-message")
+            .set_details([
+                wkt::Any::from_msg(&DebugInfo::new().set_detail("test-detail"))?,
+                wkt::Any::from_msg(&storage_error())?,
+            ]);
+        let pb: google::rpc::Status = want.clone().to_proto()?;
+        assert_eq!(pb.details.len(), 2, "{pb:?}");
+        let got = pb.cnv()?;
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    /// Details for types the service does not send on a status are dropped.
+    #[test]
+    fn unknown_details_are_dropped() -> anyhow::Result<()> {
+        let input = google::rpc::Status {
+            code: 3,
+            message: "test-message".into(),
+            details: vec![prost_types::Any::from_msg(
+                &google::cloud::bigquery::storage::v1::RowError {
+                    index: 1,
+                    ..Default::default()
+                },
+            )?],
+        };
+        assert_eq!(input.cnv()?.details, Vec::new());
+
+        let input = Status::new()
+            .set_code(3)
+            .set_message("test-message")
+            .set_details([wkt::Any::from_msg(
+                &crate::model::RowError::new().set_index(1),
+            )?]);
+        let got: google::rpc::Status = input.to_proto()?;
+        assert_eq!(got.details, Vec::new());
         Ok(())
     }
 }

@@ -31,7 +31,7 @@ use ::tonic::client::Grpc;
 use ::tonic::metadata::MetadataMap;
 use ::tonic::transport::Channel;
 use ::tonic::{Request as TonicRequest, Response as TonicResponse};
-use from_status::to_gax_error;
+use from_status::to_gax_error_with;
 use futures::TryFutureExt;
 use google_cloud_auth::credentials::Credentials;
 use google_cloud_gax::Result;
@@ -45,6 +45,7 @@ use google_cloud_gax::response::{Parts, Response};
 use google_cloud_gax::retry_loop_internal::retry_loop;
 use grpc_helpers::{add_auth_headers, make_credentials, make_headers};
 use http::HeaderMap;
+use status::DetailConverters;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -178,7 +179,7 @@ impl Client {
             request_params,
         )
         .await?
-        .map_err(to_gax_error)
+        .map_err(|s| to_gax_error_with(s, self.detail_converters()))
     }
 
     /// Opens a bidirectional stream.
@@ -222,7 +223,9 @@ impl Client {
         if let Some(recorder) = crate::observability::RequestRecorder::current() {
             match &result {
                 Ok(_) => recorder.on_grpc_response(),
-                Err(e) => recorder.on_grpc_error(&to_gax_error(e.clone())),
+                Err(e) => {
+                    recorder.on_grpc_error(&to_gax_error_with(e.clone(), self.detail_converters()))
+                }
             }
         }
         Ok(result)
@@ -258,7 +261,7 @@ impl Client {
 
         (
             streaming::create_request_sender(req_tx),
-            streaming::create_response_receiver(resp_rx),
+            streaming::create_response_receiver(resp_rx, self.detail_converters()),
         )
     }
 
@@ -323,7 +326,7 @@ impl Client {
             request_params,
         )
         .await?
-        .map_err(to_gax_error)
+        .map_err(|s| to_gax_error_with(s, self.detail_converters()))
     }
 
     /// Opens a server stream with detailed status.
@@ -371,7 +374,9 @@ impl Client {
         if let Some(recorder) = crate::observability::RequestRecorder::current() {
             match &result {
                 Ok(_) => recorder.on_grpc_response(),
-                Err(e) => recorder.on_grpc_error(&to_gax_error(e.clone())),
+                Err(e) => {
+                    recorder.on_grpc_error(&to_gax_error_with(e.clone(), self.detail_converters()))
+                }
             }
         }
         Ok(result)
@@ -407,10 +412,10 @@ impl Client {
                 request_params,
             )
             .await?
-            .map_err(to_gax_error)?;
+            .map_err(|s| to_gax_error_with(s, self.detail_converters()))?;
 
         let response_receiver = google_cloud_gax::streaming::ResponseReceiver::from_stream(
-            streaming::decode_response_stream(result.into_inner()),
+            streaming::decode_response_stream(result.into_inner(), self.detail_converters()),
         );
 
         Ok(response_receiver)
@@ -490,6 +495,7 @@ impl Client {
         crate::observability::propagation::inject_context(&span, &mut headers);
         let attempt_number = prior_attempt_count as u32 + 1;
         let start_time = self.on_attempt_start(path.path(), attempt_number, &mut headers, options);
+        let converters = self.detail_converters();
 
         let result = async {
             let metadata = MetadataMap::from_headers(headers);
@@ -512,7 +518,7 @@ impl Client {
 
             let pending = inner
                 .unary(request, path.clone(), codec)
-                .map_err(to_gax_error);
+                .map_err(move |s| to_gax_error_with(s, converters));
 
             grpc_helpers::unary_wrap_and_record_request(
                 self.metric.clone(),
@@ -525,6 +531,18 @@ impl Client {
         .await;
 
         self.on_attempt_complete(path.path(), attempt_number, start_time, result, options)
+    }
+
+    /// The service-specific status details this client converts.
+    ///
+    /// Clients that need more than the standard `google.rpc.*` detail types
+    /// supply a [DetailConverters] as a `ClientConfig` extension.
+    #[inline]
+    fn detail_converters(&self) -> DetailConverters {
+        self.extensions
+            .get::<DetailConverters>()
+            .copied()
+            .unwrap_or_default()
     }
 
     #[inline]

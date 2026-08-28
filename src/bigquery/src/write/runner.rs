@@ -17,7 +17,7 @@ use super::stream::Stream;
 use super::transport::Transport;
 use crate::Result;
 use crate::google::cloud::bigquery::storage::v1::{AppendRowsRequest, AppendRowsResponse};
-use gaxi::grpc::from_status::to_gax_error;
+use gaxi::grpc::from_status::to_gax_error_with;
 use gaxi::grpc::tonic::{Status as TonicStatus, Streaming};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -124,7 +124,10 @@ fn process_response(
     resp_txs: &mut VecDeque<oneshot::Sender<AppendResult<AppendRowsResponse>>>,
     resp: TonicResult<AppendRowsResponse>,
 ) {
-    process_gax_response(resp_txs, resp.map_err(to_gax_error))
+    process_gax_response(
+        resp_txs,
+        resp.map_err(|s| to_gax_error_with(s, super::status::CONVERTERS)),
+    )
 }
 
 fn process_gax_response(

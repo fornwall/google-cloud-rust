@@ -35,6 +35,17 @@ mod info {
 }
 
 impl Transport {
+    /// Creates the transport for the Storage Write client.
+    ///
+    /// Installs [CONVERTERS][super::status::CONVERTERS] so the transport keeps
+    /// the BigQuery-specific details of a status instead of dropping them.
+    pub(crate) async fn create(
+        mut config: gaxi::options::ClientConfig,
+    ) -> crate::ClientBuilderResult<Self> {
+        config.extensions.insert(super::status::CONVERTERS);
+        Self::new(config).await
+    }
+
     pub(crate) async fn append_rows(
         &self,
         request_params: &str,
@@ -81,7 +92,7 @@ pub(super) mod tests {
         let mut config = gaxi::options::ClientConfig::default();
         config.cred = Some(Anonymous::new().build());
         config.endpoint = Some(endpoint);
-        Ok(Transport::new(config).await?)
+        Ok(Transport::create(config).await?)
     }
 
     // Both crates have their own copies of the protos. We can just serialize

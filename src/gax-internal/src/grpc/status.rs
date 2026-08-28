@@ -20,11 +20,112 @@ use google_cloud_rpc::model::{
     RequestInfo, ResourceInfo, RetryInfo,
 };
 
-pub(crate) fn status_from_proto(s: google::rpc::Status) -> Status {
+/// Converts one service-specific status detail between its wire and idiomatic
+/// forms.
+///
+/// This library only knows the standard `google.rpc.*` detail types. Services
+/// that attach their own messages to a status, such as
+/// `google.cloud.bigquery.storage.v1.StorageError`, describe them with this
+/// type and supply them through [DetailConverters].
+///
+/// Each function returns `None` when it does not recognize the detail, which
+/// lets the caller try the next converter.
+#[derive(Clone, Copy, Debug)]
+pub struct DetailConverter {
+    /// Converts the detail from its wire form.
+    pub from_prost: fn(&prost_types::Any) -> Option<wkt::Any>,
+    /// Converts the detail to its wire form.
+    pub to_prost: fn(&wkt::Any) -> Option<prost_types::Any>,
+}
+
+impl DetailConverter {
+    /// Describes a detail type by its Protobuf-generated type `P` and its
+    /// idiomatic type `T`.
+    ///
+    /// # Example
+    /// ```text
+    /// use google_cloud_gax_internal::grpc::status::{DetailConverter, DetailConverters};
+    ///
+    /// const CONVERTERS: DetailConverters = DetailConverters(&[
+    ///     DetailConverter::new::<proto::StorageError, model::StorageError>(),
+    /// ]);
+    /// ```
+    pub const fn new<P, T>() -> Self
+    where
+        P: prost::Message + prost::Name + Default + FromProto<T>,
+        T: wkt::message::Message + ToProto<P, Output = P>,
+    {
+        Self {
+            from_prost: from_prost::<P, T>,
+            to_prost: to_prost::<P, T>,
+        }
+    }
+}
+
+fn from_prost<P, T>(value: &prost_types::Any) -> Option<wkt::Any>
+where
+    P: prost::Message + prost::Name + Default + FromProto<T>,
+    T: wkt::message::Message,
+{
+    // `to_msg` verifies the type URL, so a converter for a different type
+    // simply yields `None`.
+    let msg = value.to_msg::<P>().ok()?;
+    wkt::Any::from_msg(&msg.cnv().ok()?).ok()
+}
+
+fn to_prost<P, T>(value: &wkt::Any) -> Option<prost_types::Any>
+where
+    P: prost::Message + prost::Name,
+    T: wkt::message::Message + ToProto<P, Output = P>,
+{
+    // As above, `to_msg` verifies the type URL.
+    let msg = value.to_msg::<T>().ok()?;
+    prost_types::Any::from_msg(&msg.to_proto().ok()?).ok()
+}
+
+/// The service-specific status details a client knows how to convert.
+///
+/// Clients that need this supply it as a [ClientConfig] extension. It then
+/// applies to every status the client converts, whether the status arrives as
+/// a `tonic::Status` or as a field of a response message.
+///
+/// [ClientConfig]: crate::options::ClientConfig
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DetailConverters(pub &'static [DetailConverter]);
+
+impl DetailConverters {
+    /// No service-specific details; only the standard `google.rpc.*` types are
+    /// converted.
+    pub const NONE: Self = Self(&[]);
+}
+
+pub(crate) fn status_from_proto(s: google::rpc::Status, extra: DetailConverters) -> Status {
     Status::new()
         .set_code(s.code)
         .set_message(s.message)
-        .set_details(s.details.into_iter().filter_map(any_from_prost))
+        .set_details(
+            s.details
+                .into_iter()
+                .filter_map(|d| any_from_prost_with(&d, extra)),
+        )
+}
+
+/// Converts a status detail from its wire form, including the service-specific
+/// types in `extra`.
+pub fn any_from_prost_with(value: &prost_types::Any, extra: DetailConverters) -> Option<wkt::Any> {
+    if let Some(any) = extra.0.iter().find_map(|c| (c.from_prost)(value)) {
+        return Some(any);
+    }
+    any_from_prost(value.clone())
+}
+
+/// Converts a status detail to its wire form, including the service-specific
+/// types in `extra`.
+pub fn any_to_prost_with(value: &wkt::Any, extra: DetailConverters) -> Option<prost_types::Any> {
+    if let Some(any) = extra.0.iter().find_map(|c| (c.to_prost)(value)) {
+        return Some(any);
+    }
+    any_to_prost(value.clone())
 }
 
 pub fn any_to_prost(value: wkt::Any) -> Option<prost_types::Any> {
@@ -144,6 +245,98 @@ pub fn any_from_prost(value: prost_types::Any) -> Option<wkt::Any> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `google.rpc.BadRequest.FieldViolation` is a real message that is not one
+    // of the ten status details this library knows, which makes it a good
+    // stand-in for a service-specific detail type.
+    type ProtoDetail = google::rpc::bad_request::FieldViolation;
+    type ModelDetail = google_cloud_rpc::model::bad_request::FieldViolation;
+
+    const CONVERTERS: DetailConverters =
+        DetailConverters(&[DetailConverter::new::<ProtoDetail, ModelDetail>()]);
+
+    fn model_detail() -> ModelDetail {
+        ModelDetail::new()
+            .set_field("field")
+            .set_description("desc")
+    }
+
+    fn proto_detail() -> ProtoDetail {
+        #[allow(clippy::needless_update)]
+        ProtoDetail {
+            field: "field".into(),
+            description: "desc".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Without a converter the detail is dropped, with one it survives.
+    #[test]
+    fn extra_detail_from_prost() -> anyhow::Result<()> {
+        let input = prost_types::Any::from_msg(&proto_detail())?;
+        assert_eq!(any_from_prost_with(&input, DetailConverters::NONE), None);
+        assert_eq!(
+            any_from_prost_with(&input, CONVERTERS),
+            Some(wkt::Any::from_msg(&model_detail())?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extra_detail_to_prost() -> anyhow::Result<()> {
+        let input = wkt::Any::from_msg(&model_detail())?;
+        assert_eq!(any_to_prost_with(&input, DetailConverters::NONE), None);
+        assert_eq!(
+            any_to_prost_with(&input, CONVERTERS),
+            Some(prost_types::Any::from_msg(&proto_detail())?)
+        );
+        Ok(())
+    }
+
+    /// The standard details are still converted when extra converters exist,
+    /// and details that match no converter are still dropped.
+    #[test]
+    fn extra_converters_do_not_shadow_the_standard_ones() -> anyhow::Result<()> {
+        use google::rpc::Help;
+        let standard = prost_types::Any::from_msg(&ErrorInfo::default().to_proto()?)?;
+        assert!(any_from_prost_with(&standard, CONVERTERS).is_some());
+
+        // `Help` is a standard detail, `help::Link` is not, and neither has a
+        // converter in `CONVERTERS`.
+        let unknown = prost_types::Any::from_msg(&google::rpc::help::Link::default())?;
+        assert_eq!(any_from_prost_with(&unknown, CONVERTERS), None);
+        let known = prost_types::Any::from_msg(&Help::default())?;
+        assert!(any_from_prost_with(&known, CONVERTERS).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn status_from_proto_keeps_extra_details() -> anyhow::Result<()> {
+        let input = google::rpc::Status {
+            code: 3,
+            message: "test-only".into(),
+            details: vec![
+                prost_types::Any::from_msg(&ErrorInfo::default().to_proto()?)?,
+                prost_types::Any::from_msg(&proto_detail())?,
+            ],
+        };
+        let got = status_from_proto(input.clone(), CONVERTERS);
+        assert_eq!(
+            got.details,
+            vec![
+                wkt::Any::from_msg(&ErrorInfo::default())?,
+                wkt::Any::from_msg(&model_detail())?
+            ]
+        );
+
+        // The same status keeps only the standard detail without converters.
+        let got = status_from_proto(input, DetailConverters::NONE);
+        assert_eq!(
+            got.details,
+            vec![wkt::Any::from_msg(&ErrorInfo::default())?]
+        );
+        Ok(())
+    }
 
     #[test]
     fn from_proto() -> anyhow::Result<()> {
