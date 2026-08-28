@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{ConvertError, RowError};
-use crate::query::{FromSql, Schema};
+use crate::query::{FromSql, FromSqlContext, Schema};
 use google_cloud_bigquery_v2::model::TableFieldSchema;
 use std::sync::Arc;
 use wkt::{ListValue, Struct, Value};
@@ -116,7 +116,11 @@ impl Row {
     }
 
     fn convert_value_at<T: FromSql>(&self, idx: usize, val: Value) -> Result<T> {
-        T::from_sql(val).map_err(|e| {
+        let field = self
+            .schema
+            .get_field_by_index(idx)
+            .expect("index was resolved against the schema");
+        T::from_sql_with_context(val, &FromSqlContext::field(field)).map_err(|e| {
             let field_name = self
                 .schema
                 .get_field_by_index(idx)
@@ -282,13 +286,7 @@ fn convert_repeated(mut value: ListValue, field: &TableFieldSchema) -> Result<Va
 }
 
 fn convert_nested(value: Struct, fields: &[TableFieldSchema]) -> Result<Value> {
-    let values = convert_row(value, fields)?;
-    let obj: Struct = fields
-        .iter()
-        .zip(values)
-        .map(|(field, value)| (field.name.clone(), value))
-        .collect();
-    Ok(Value::Object(obj))
+    convert_row(value, fields).map(Value::Array)
 }
 
 fn convert_basic_type(value: String, field_name: &str, field_type: &str) -> Result<Value> {
@@ -693,6 +691,238 @@ mod tests {
         assert_eq!(row.get::<Vec<Struct>, _>("users"), expected);
         assert_eq!(row.take::<Vec<Struct>, _>("users")?, expected);
         assert_eq!(row.try_get::<Option<Vec<Struct>>, _>("users")?, None);
+
+        Ok(())
+    }
+
+    #[derive(FromSql, Debug, PartialEq)]
+    struct ProjectedAddress {
+        city: String,
+    }
+
+    #[derive(FromSql, Debug, PartialEq)]
+    struct ProjectedUser {
+        address: ProjectedAddress,
+        age: i64,
+        #[bigquery(rename = "name")]
+        display_name: String,
+    }
+
+    #[derive(FromSql, Debug)]
+    struct DuplicateProjection {
+        #[bigquery(rename = "name")]
+        _first: String,
+        #[bigquery(rename = "name")]
+        _second: Option<String>,
+    }
+
+    #[derive(FromSql, Debug, PartialEq)]
+    struct MacroHygieneProjection {
+        field_context: String,
+        field_index: i64,
+        field_value: bool,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CustomRecord(Value);
+
+    impl FromSql for CustomRecord {
+        fn from_sql(value: Value) -> std::result::Result<Self, ConvertError> {
+            Ok(Self(value))
+        }
+    }
+
+    fn user_schema(name: &str, mode: &str) -> TableFieldSchema {
+        TableFieldSchema::new()
+            .set_name(name)
+            .set_type("RECORD")
+            .set_mode(mode)
+            .set_fields([
+                TableFieldSchema::new()
+                    .set_name("name")
+                    .set_type("STRING")
+                    .set_mode("NULLABLE"),
+                TableFieldSchema::new()
+                    .set_name("age")
+                    .set_type("INTEGER")
+                    .set_mode("NULLABLE"),
+                TableFieldSchema::new()
+                    .set_name("ignored")
+                    .set_type("BOOLEAN")
+                    .set_mode("NULLABLE"),
+                TableFieldSchema::new()
+                    .set_name("address")
+                    .set_type("RECORD")
+                    .set_mode("NULLABLE")
+                    .set_fields([
+                        TableFieldSchema::new()
+                            .set_name("city")
+                            .set_type("STRING")
+                            .set_mode("NULLABLE"),
+                        TableFieldSchema::new()
+                            .set_name("zip")
+                            .set_type("INTEGER")
+                            .set_mode("NULLABLE"),
+                    ]),
+            ])
+    }
+
+    fn raw_user(name: &str, age: i64, city: &str) -> Value {
+        json!({
+            "f": [
+                { "v": name },
+                { "v": age.to_string() },
+                { "v": "TRUE" },
+                { "v": { "f": [
+                    { "v": city },
+                    { "v": "12345" }
+                ] } }
+            ]
+        })
+    }
+
+    #[test]
+    fn positional_records_preserve_typed_and_legacy_views() -> TestResult {
+        let raw_row = Map::from_iter([(
+            "f".to_string(),
+            Value::Array(
+                vec![
+                    Value::Object(raw_user("Alice", 25, "Paris").as_object().unwrap().clone()),
+                    json!([
+                        { "v": raw_user("Bob", 28, "London") },
+                        { "v": raw_user("Charlie", 31, "Berlin") }
+                    ]),
+                    Value::Object(raw_user("Dana", 34, "Oslo").as_object().unwrap().clone()),
+                    Value::Object(raw_user("Eve", 37, "Rome").as_object().unwrap().clone()),
+                ]
+                .into_iter()
+                .map(|value| json!({ "v": value }))
+                .collect(),
+            ),
+        )]);
+        let schema = TableSchema::new().set_fields([
+            user_schema("user", "NULLABLE"),
+            user_schema("users", "REPEATED"),
+            user_schema("raw", "NULLABLE"),
+            user_schema("custom", "NULLABLE"),
+        ]);
+        let schema = Arc::new(Schema::new(schema));
+        let row = Row::try_new(raw_row, &schema)?;
+
+        // Nested records stay positional in Row until a consumer asks for a
+        // legacy raw object representation.
+        assert!(matches!(row.values.get(0), Some(Value::Array(_))));
+        assert!(matches!(row.values.get(1), Some(Value::Array(values)) if
+            matches!(values.first(), Some(Value::Array(_)))));
+
+        assert_eq!(
+            row.get::<ProjectedUser, _>("user"),
+            ProjectedUser {
+                address: ProjectedAddress {
+                    city: "Paris".into()
+                },
+                age: 25,
+                display_name: "Alice".into(),
+            }
+        );
+        assert_eq!(
+            row.get::<Option<ProjectedUser>, _>("user").unwrap(),
+            ProjectedUser {
+                address: ProjectedAddress {
+                    city: "Paris".into()
+                },
+                age: 25,
+                display_name: "Alice".into(),
+            }
+        );
+        assert_eq!(
+            row.get::<Vec<ProjectedUser>, _>("users"),
+            vec![
+                ProjectedUser {
+                    address: ProjectedAddress {
+                        city: "London".into()
+                    },
+                    age: 28,
+                    display_name: "Bob".into(),
+                },
+                ProjectedUser {
+                    address: ProjectedAddress {
+                        city: "Berlin".into()
+                    },
+                    age: 31,
+                    display_name: "Charlie".into(),
+                },
+            ]
+        );
+
+        let expected_raw = json!({
+            "name": "Dana",
+            "age": 34,
+            "ignored": true,
+            "address": { "city": "Oslo", "zip": 12345 }
+        });
+        assert_eq!(row.get::<Value, _>("raw"), expected_raw);
+        assert_eq!(
+            row.get::<Struct, _>("raw"),
+            expected_raw.as_object().unwrap().clone()
+        );
+
+        let expected_custom = json!({
+            "name": "Eve",
+            "age": 37,
+            "ignored": true,
+            "address": { "city": "Rome", "zip": 12345 }
+        });
+        assert_eq!(
+            row.get::<CustomRecord, _>("custom"),
+            CustomRecord(expected_custom)
+        );
+
+        assert!(matches!(
+            row.try_get::<DuplicateProjection, _>("user"),
+            Err(RowError::TypeConversion {
+                source: ConvertError::MissingField(field),
+                ..
+            }) if field == "name"
+        ));
+
+        let hygiene_row = Map::from_iter([(
+            "f".to_string(),
+            json!([
+                { "v": { "f": [
+                    { "v": "context" },
+                    { "v": "42" },
+                    { "v": "TRUE" }
+                ] } }
+            ]),
+        )]);
+        let hygiene_schema = TableSchema::new().set_fields([TableFieldSchema::new()
+            .set_name("hygiene")
+            .set_type("RECORD")
+            .set_mode("NULLABLE")
+            .set_fields([
+                TableFieldSchema::new()
+                    .set_name("field_context")
+                    .set_type("STRING")
+                    .set_mode("NULLABLE"),
+                TableFieldSchema::new()
+                    .set_name("field_index")
+                    .set_type("INTEGER")
+                    .set_mode("NULLABLE"),
+                TableFieldSchema::new()
+                    .set_name("field_value")
+                    .set_type("BOOLEAN")
+                    .set_mode("NULLABLE"),
+            ])]);
+        let hygiene_row = Row::try_new(hygiene_row, &Arc::new(Schema::new(hygiene_schema)))?;
+        assert_eq!(
+            hygiene_row.get::<MacroHygieneProjection, _>("hygiene"),
+            MacroHygieneProjection {
+                field_context: "context".into(),
+                field_index: 42,
+                field_value: true,
+            }
+        );
 
         Ok(())
     }

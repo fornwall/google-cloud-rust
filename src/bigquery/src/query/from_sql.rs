@@ -18,6 +18,101 @@ use base64::prelude::BASE64_STANDARD;
 use wkt::{Struct, Timestamp, Value};
 
 use crate::error::ConvertError;
+use google_cloud_bigquery_v2::model::TableFieldSchema;
+
+/// Schema context used by BigQuery row conversion.
+///
+/// This is an implementation detail shared with the `FromSql` derive macro.
+/// It is public only so generated implementations can use it across crate
+/// boundaries.
+#[doc(hidden)]
+pub struct FromSqlContext<'a> {
+    field: &'a TableFieldSchema,
+    repeated_element: bool,
+}
+
+impl<'a> FromSqlContext<'a> {
+    pub(crate) fn field(field: &'a TableFieldSchema) -> Self {
+        Self {
+            field,
+            repeated_element: false,
+        }
+    }
+
+    /// Returns the schema position of a nested field.
+    #[doc(hidden)]
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        self.field
+            .fields
+            .iter()
+            .position(|field| field.name == name)
+    }
+
+    /// Returns the context for a nested field at `index`.
+    #[doc(hidden)]
+    pub fn nested_field(&self, index: usize) -> Option<Self> {
+        self.field.fields.get(index).map(Self::field)
+    }
+
+    fn repeated_element(&self) -> Self {
+        Self {
+            field: self.field,
+            repeated_element: true,
+        }
+    }
+
+    fn is_repeated(&self) -> bool {
+        !self.repeated_element && self.field.mode == "REPEATED"
+    }
+
+    fn is_record(&self) -> bool {
+        matches!(self.field.r#type.as_str(), "RECORD" | "STRUCT")
+    }
+
+    /// Materializes the object representation historically exposed by `Row`.
+    #[doc(hidden)]
+    pub fn materialize(&self, value: wkt::Value) -> Result<wkt::Value, ConvertError> {
+        if matches!(value, wkt::Value::Null) {
+            return Ok(value);
+        }
+
+        if self.is_repeated() {
+            return match value {
+                wkt::Value::Array(values) => values
+                    .into_iter()
+                    .map(|value| self.repeated_element().materialize(value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(wkt::Value::Array),
+                other => Err(ConvertError::TypeMismatch {
+                    expected: "array",
+                    got: other,
+                }),
+            };
+        }
+
+        if self.is_record() {
+            return match value {
+                wkt::Value::Array(values) => {
+                    let object = self
+                        .field
+                        .fields
+                        .iter()
+                        .zip(values)
+                        .map(|(field, value)| {
+                            Self::field(field)
+                                .materialize(value)
+                                .map(|value| (field.name.clone(), value))
+                        })
+                        .collect::<Result<wkt::Struct, _>>()?;
+                    Ok(wkt::Value::Object(object))
+                }
+                other => Ok(other),
+            };
+        }
+
+        Ok(value)
+    }
+}
 
 pub(crate) const BIGQUERY_DATE_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[year]-[month]-[day]");
@@ -73,6 +168,19 @@ pub(crate) const BIGQUERY_DATETIME_SUBSEC_FORMAT: &[time::format_description::Fo
 pub trait FromSql: Sized {
     /// Converts a BigQuery `wkt::Value` into the implementing type.
     fn from_sql(value: wkt::Value) -> Result<Self, ConvertError>;
+
+    /// Converts a value using its BigQuery schema context.
+    ///
+    /// This hook is an implementation detail used by `Row` and the `FromSql`
+    /// derive. Its default preserves the object representation that custom
+    /// implementations historically received.
+    #[doc(hidden)]
+    fn from_sql_with_context(
+        value: wkt::Value,
+        context: &FromSqlContext<'_>,
+    ) -> Result<Self, ConvertError> {
+        Self::from_sql(context.materialize(value)?)
+    }
 }
 
 impl FromSql for wkt::Value {
@@ -191,12 +299,46 @@ impl<T: FromSql> FromSql for Option<T> {
             other => T::from_sql(other).map(Some),
         }
     }
+
+    fn from_sql_with_context(
+        value: wkt::Value,
+        context: &FromSqlContext<'_>,
+    ) -> Result<Self, ConvertError> {
+        match value {
+            wkt::Value::Null => Ok(None),
+            other => T::from_sql_with_context(other, context).map(Some),
+        }
+    }
 }
 
 impl<T: FromSql> FromSql for Vec<T> {
     fn from_sql(value: wkt::Value) -> Result<Self, ConvertError> {
         match value {
             wkt::Value::Array(arr) => arr.into_iter().map(T::from_sql).collect(),
+            wkt::Value::Null => Err(ConvertError::NotNull),
+            other => Err(ConvertError::TypeMismatch {
+                expected: "array",
+                got: other,
+            }),
+        }
+    }
+
+    fn from_sql_with_context(
+        value: wkt::Value,
+        context: &FromSqlContext<'_>,
+    ) -> Result<Self, ConvertError> {
+        if !context.is_repeated() {
+            return Self::from_sql(context.materialize(value)?);
+        }
+
+        match value {
+            wkt::Value::Array(values) => {
+                let element_context = context.repeated_element();
+                values
+                    .into_iter()
+                    .map(|value| T::from_sql_with_context(value, &element_context))
+                    .collect()
+            }
             wkt::Value::Null => Err(ConvertError::NotNull),
             other => Err(ConvertError::TypeMismatch {
                 expected: "array",
