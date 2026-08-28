@@ -225,7 +225,12 @@ impl Row {
 }
 
 fn convert_row(row: Struct, fields: &[TableFieldSchema]) -> Result<ListValue> {
-    let mut field_list = get_field_list(row)?;
+    let (_, field_list) = convert_row_parts(row, fields)?;
+    Ok(field_list)
+}
+
+fn convert_row_parts(mut row: Struct, fields: &[TableFieldSchema]) -> Result<(Struct, ListValue)> {
+    let mut field_list = get_field_list(&mut row)?;
 
     if field_list.len() != fields.len() {
         return Err(RowError::InvalidRowFormat(format!(
@@ -238,10 +243,10 @@ fn convert_row(row: Struct, fields: &[TableFieldSchema]) -> Result<ListValue> {
     for (cell, field) in field_list.iter_mut().zip(fields) {
         *cell = convert_value(get_field_value(cell.take())?, field)?;
     }
-    Ok(field_list)
+    Ok((row, field_list))
 }
 
-fn get_field_list(mut row: Struct) -> Result<Vec<Value>> {
+fn get_field_list(row: &mut Struct) -> Result<Vec<Value>> {
     match row.remove("f") {
         Some(Value::Array(arr)) => Ok(arr),
         Some(_) => Err(RowError::InvalidRowFormat("invalid field values".into())),
@@ -282,12 +287,21 @@ fn convert_repeated(mut value: ListValue, field: &TableFieldSchema) -> Result<Va
 }
 
 fn convert_nested(value: Struct, fields: &[TableFieldSchema]) -> Result<Value> {
-    let values = convert_row(value, fields)?;
-    let obj: Struct = fields
+    let (mut reusable, values) = convert_row_parts(value, fields)?;
+    // Removing `f` leaves the map's allocation available for reuse. Clear any
+    // ignored sibling keys before seeding the converted object with it.
+    reusable.retain(|_, _| false);
+
+    let mut pairs = fields
         .iter()
         .zip(values)
-        .map(|(field, value)| (field.name.clone(), value))
-        .collect();
+        .map(|(field, value)| (field.name.clone(), value));
+    let mut obj = Struct::with_capacity(fields.len());
+    if let Some((name, value)) = pairs.next() {
+        reusable.insert(name, value);
+        obj.append(&mut reusable);
+    }
+    obj.extend(pairs);
     Ok(Value::Object(obj))
 }
 
@@ -564,19 +578,20 @@ mod tests {
 
     #[tokio::test]
     async fn convert_record_from_row() -> TestResult {
-        let raw_row = Map::from_iter([(
-            "f".to_string(),
-            json!([
+        let raw_row = serde_json::from_value(json!({
+            "ignored": "top-level sibling",
+            "f": [
                 {
                     "v": {
+                        "ignored": "nested sibling",
                         "f": [
                             { "v": "Alice" },
                             { "v": "25" }
                         ]
                     }
                 }
-            ]),
-        )]);
+            ]
+        }))?;
         let schema = TableSchema::new().set_fields([TableFieldSchema::new()
             .set_name("user")
             .set_type("RECORD")
@@ -603,6 +618,17 @@ mod tests {
         assert_eq!(row.take::<Struct, _>("user")?, expected);
         assert_eq!(row.try_get::<Option<Struct>, _>("user")?, None);
 
+        Ok(())
+    }
+
+    #[test]
+    fn convert_empty_record_from_row() -> TestResult {
+        let raw_record = serde_json::from_value(json!({
+            "ignored": "nested sibling",
+            "f": [],
+        }))?;
+
+        assert_eq!(convert_nested(raw_record, &[])?, json!({}));
         Ok(())
     }
 
