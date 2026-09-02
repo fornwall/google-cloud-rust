@@ -21,11 +21,11 @@ use crate::{
 };
 use google_cloud_gax::error::CredentialsError;
 use hmac::{Hmac, KeyInit, Mac};
-use jiff::Timestamp;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 const AWS_REGION: &str = "AWS_REGION";
 const AWS_DEFAULT_REGION: &str = "AWS_DEFAULT_REGION";
@@ -127,9 +127,7 @@ impl SubjectTokenProvider for AwsSourcedCredentials {
             .resolve_credentials(&client, imdsv2_token.as_deref())
             .await?;
 
-        let now = Timestamp::now();
-        let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
-        let date_stamp = now.strftime("%Y%m%d").to_string();
+        let (amz_date, date_stamp) = format_signing_dates(OffsetDateTime::now_utc());
 
         let url = resolve_sts_url(self.regional_cred_verification_url.as_deref(), &region)?;
         let host = url.host_str().unwrap(); // unwrap is safe because resolve_sts_url checks for a host
@@ -255,6 +253,24 @@ fn hmac_sha256(key: &[u8], data: &str) -> Result<Vec<u8>> {
     })?;
     mac.update(data.as_bytes());
     Ok(mac.finalize().into_bytes().to_vec())
+}
+
+// Formats the timestamp as the pair of dates used by AWS SigV4: the full
+// `x-amz-date` value, and the day-only stamp used in the credential scope.
+fn format_signing_dates(now: OffsetDateTime) -> (String, String) {
+    let date_stamp = format!(
+        "{:04}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    );
+    let amz_date = format!(
+        "{date_stamp}T{:02}{:02}{:02}Z",
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    (amz_date, date_stamp)
 }
 
 fn get_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Result<Vec<u8>> {
@@ -460,6 +476,17 @@ mod tests {
     #[test_case("a", Some("a"); "short_zone")]
     fn test_parse_region_from_zone(zone: &str, expected: Option<&str>) {
         assert_eq!(parse_region_from_zone(zone), expected);
+    }
+
+    #[test_case(1234567890, "20090213T233130Z", "20090213"; "no_padding")]
+    #[test_case(981173106, "20010203T040506Z", "20010203"; "zero_padded")]
+    fn test_format_signing_dates(unix: i64, amz_date: &str, date_stamp: &str) -> TestResult {
+        let now = OffsetDateTime::from_unix_timestamp(unix)?;
+        assert_eq!(
+            format_signing_dates(now),
+            (amz_date.to_string(), date_stamp.to_string())
+        );
+        Ok(())
     }
 
     #[test_case(None, "us-east-1", "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15"; "default_template")]
