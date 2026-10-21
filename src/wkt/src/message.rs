@@ -155,16 +155,12 @@ pub(crate) fn from_object<T>(map: &Map) -> Result<T, Error>
 where
     T: Message,
 {
-    let map = map
-        .iter()
-        .filter_map(|(k, v)| {
-            if k == "@type" {
-                return None;
-            }
-            Some((k.clone(), v.clone()))
-        })
-        .collect();
-    serde_json::from_value::<T>(serde_json::Value::Object(map)).map_err(Error::deser)
+    fn without_type(map: &Map) -> Map {
+        let mut map = map.clone();
+        map.remove("@type");
+        map
+    }
+    serde_json::from_value::<T>(serde_json::Value::Object(without_type(map))).map_err(Error::deser)
 }
 
 /// The analog of `to_json_other()`
