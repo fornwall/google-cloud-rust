@@ -128,7 +128,10 @@ impl TokenProvider for ServiceAccountTokenProvider {
         );
         let assertion = tg.generate()?;
 
-        let client = Client::new();
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| crate::errors::from_http_error(e, "failed to exchange id token"))?;
         let request = client.post(&self.token_server_url).form(&[
             ("grant_type", JWT_BEARER_GRANT_TYPE.to_string()),
             ("assertion", assertion),
@@ -286,6 +289,33 @@ mod tests {
 
         let err = creds.id_token().await.unwrap_err();
         assert!(err.is_transient());
+        Ok(())
+    }
+
+    // 302 would be followed as a GET, 307 would re-send the POST body.
+    #[test_case::test_case(302)]
+    #[test_case::test_case(307)]
+    #[tokio::test]
+    async fn idtoken_does_not_follow_redirects(status: u16) -> TestResult {
+        // httptest fails the test on drop if a request reaches this server.
+        let destination = Server::run();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/")).respond_with(
+                status_code(status)
+                    .append_header("Location", destination.url_str("/redirected-token")),
+            ),
+        );
+
+        let mut service_account_key = get_mock_service_key();
+        service_account_key["private_key"] = Value::from(PKCS8_PK.clone());
+        let creds = Builder::new("test-audience", service_account_key)
+            .with_token_server_url(server.url_str("/"))
+            .build()?;
+
+        let err = creds.id_token().await.unwrap_err();
+        assert!(!err.is_transient(), "{err:?}");
+        assert!(err.to_string().contains(&status.to_string()), "{err:?}");
         Ok(())
     }
 
