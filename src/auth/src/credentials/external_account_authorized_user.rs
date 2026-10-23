@@ -329,7 +329,6 @@ impl Builder {
         });
 
         let token_provider = ExternalAccountAuthorizedUserTokenProvider {
-            client: Client::new(),
             client_id: authorized_user.client_id,
             client_secret: authorized_user.client_secret,
             refresh_token: Mutex::new(authorized_user.refresh_token),
@@ -351,7 +350,6 @@ impl Builder {
 }
 
 struct ExternalAccountAuthorizedUserTokenProvider {
-    client: Client,
     client_id: String,
     client_secret: String,
     // STS may rotate the refresh token, returning a new one with each access
@@ -383,8 +381,11 @@ impl TokenProvider for ExternalAccountAuthorizedUserTokenProvider {
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
         ];
-        let resp = self
-            .client
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| errors::from_http_error(e, MSG))?;
+        let resp = client
             .post(self.token_url.as_str())
             .basic_auth(&self.client_id, Some(&self.client_secret))
             .form(&params)
@@ -566,7 +567,6 @@ mod tests {
     #[test]
     fn debug_token_provider() {
         let provider = ExternalAccountAuthorizedUserTokenProvider {
-            client: Client::new(),
             client_id: "test-client-id".to_string(),
             client_secret: "test-client-secret".to_string(),
             refresh_token: Mutex::new("test-refresh-token".to_string()),
@@ -603,6 +603,33 @@ mod tests {
         Ok(())
     }
 
+    // 302 would be followed as a GET, 307 would re-send the POST body.
+    #[test_case::test_case(302)]
+    #[test_case::test_case(307)]
+    #[tokio::test]
+    async fn token_refresh_does_not_follow_redirects(status: u16) -> TestResult {
+        // httptest fails the test on drop if a request reaches this server.
+        let destination = Server::run();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/token")).respond_with(
+                status_code(status)
+                    .append_header("Location", destination.url_str("/redirected-token")),
+            ),
+        );
+
+        let tp = ExternalAccountAuthorizedUserTokenProvider {
+            client_id: "test-client-id".to_string(),
+            client_secret: "test-client-secret".to_string(),
+            refresh_token: Mutex::new("test-refresh-token".to_string()),
+            token_url: server.url_str("/token"),
+        };
+        let err = tp.token().await.unwrap_err();
+        assert!(!err.is_transient(), "{err:?}");
+        assert!(err.to_string().contains(&status.to_string()), "{err:?}");
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn token_provider_success() -> TestResult {
         let server = Server::run();
@@ -624,7 +651,6 @@ mod tests {
         );
 
         let tp = ExternalAccountAuthorizedUserTokenProvider {
-            client: Client::new(),
             client_id: "test-client-id".to_string(),
             client_secret: "test-client-secret".to_string(),
             refresh_token: Mutex::new("test-refresh-token".to_string()),
@@ -689,7 +715,6 @@ mod tests {
         );
 
         let tp = ExternalAccountAuthorizedUserTokenProvider {
-            client: Client::new(),
             client_id: "test-client-id".to_string(),
             client_secret: "test-client-secret".to_string(),
             refresh_token: Mutex::new("test-refresh-token".to_string()),

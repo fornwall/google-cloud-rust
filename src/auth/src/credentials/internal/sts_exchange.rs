@@ -104,7 +104,8 @@ impl STSHandler {
         headers: http::HeaderMap,
         params: HashMap<&str, String>,
     ) -> Result<TokenResponse> {
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder =
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
 
         if let Some(path) = self.ca_cert_path {
             client_builder = add_root_cert(client_builder, path).await?;
@@ -224,6 +225,36 @@ mod tests {
     use std::error::Error as _;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    // 302 would be followed as a GET, 307 would re-send the POST body.
+    #[test_case::test_case(302)]
+    #[test_case::test_case(307)]
+    #[tokio::test]
+    async fn token_exchange_does_not_follow_redirects(status: u16) -> TestResult {
+        // httptest fails the test on drop if a request reaches this server.
+        let destination = Server::run();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/sts")).respond_with(
+                status_code(status)
+                    .append_header("Location", destination.url_str("/redirected-token")),
+            ),
+        );
+
+        let token_req = ExchangeTokenRequest {
+            url: server.url_str("/sts"),
+            subject_token: "test-subject-token".to_string(),
+            subject_token_type: JWT_TOKEN_TYPE.to_string(),
+            ..ExchangeTokenRequest::default()
+        };
+        let err = STSHandler::default()
+            .exchange_token(token_req)
+            .await
+            .unwrap_err();
+        assert!(!err.is_transient(), "{err:?}");
+        assert!(err.to_string().contains(&status.to_string()), "{err:?}");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn exchange_token() -> TestResult {

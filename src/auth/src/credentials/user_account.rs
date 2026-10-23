@@ -450,7 +450,10 @@ impl UserTokenProvider {
 #[async_trait::async_trait]
 impl TokenProvider for UserTokenProvider {
     async fn token(&self) -> Result<Token> {
-        let client = Client::new();
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| errors::from_http_error(e, MSG))?;
 
         // Make the request
         let req = Oauth2RefreshRequest {
@@ -612,6 +615,30 @@ mod tests {
             "type": "authorized_user",
             "token_uri": token_uri,
         })
+    }
+
+    // 302 would be followed as a GET, 307 would re-send the POST body.
+    #[test_case::test_case(302)]
+    #[test_case::test_case(307)]
+    #[tokio::test]
+    async fn token_refresh_does_not_follow_redirects(status: u16) -> TestResult {
+        // httptest fails the test on drop if a request reaches this server.
+        let destination = Server::run();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/token")).respond_with(
+                status_code(status)
+                    .append_header("Location", destination.url_str("/redirected-token")),
+            ),
+        );
+
+        let credentials = Builder::new(authorized_user_json(server.url_str("/token"))).build()?;
+
+        let err = credentials.headers(Extensions::new()).await.unwrap_err();
+        assert!(!err.is_transient(), "{err:?}");
+        let err = find_source_error::<CredentialsError>(&err).unwrap();
+        assert!(err.to_string().contains(&status.to_string()), "{err:?}");
+        Ok(())
     }
 
     #[tokio::test]

@@ -85,9 +85,14 @@ pub(crate) fn from_http_error(err: reqwest::Error, msg: &str) -> CredentialsErro
 }
 
 pub(crate) async fn from_http_response(response: reqwest::Response, msg: &str) -> CredentialsError {
-    let err = response
-        .error_for_status_ref()
-        .expect_err("this function is only called on errors");
+    let Err(err) = response.error_for_status_ref() else {
+        // reqwest only treats 4xx and 5xx as errors, but token endpoints may
+        // return other unsuccessful statuses, such as redirects.
+        return CredentialsError::from_msg(
+            false,
+            format!("{msg}, unexpected HTTP status: {}", response.status()),
+        );
+    };
     let body = response.text().await;
     let transient = crate::errors::is_retryable(&err);
     match body {
