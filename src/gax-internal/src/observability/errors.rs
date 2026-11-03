@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::attributes::error_type_values::*;
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 use crate::observability::attributes::keys::*;
 use google_cloud_gax::error::{Error, rpc::Code, rpc::StatusDetails};
 use http::StatusCode;
@@ -111,6 +112,7 @@ pub fn error_type(err: &Error) -> String {
     ErrorType::from_gax_error(err).to_string()
 }
 
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub(crate) fn emit_error_log(span: &tracing::Span, err: &Error) {
     let error_type = ErrorType::from_gax_error(err);
     let rpc_status_code = err.status().map(|s| s.code.name());
@@ -256,6 +258,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
     #[ignore = "TODO(#6077) - disabled because it is flaky"]
     fn test_emit_error_log() {
         {

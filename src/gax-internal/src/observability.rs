@@ -16,7 +16,12 @@
 //!
 //! This module and its sub-modules contain types and functions for emitting
 //! tracing spans and metrics.
+//!
+//! Error classification and schema metadata are available with `_internal-common`
+//! without OpenTelemetry dependencies. Both transport features additionally enable
+//! `_internal-observability` to preserve their existing instrumentation.
 
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub(crate) mod propagation;
 
 pub(crate) mod attributes;

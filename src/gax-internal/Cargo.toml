@@ -42,6 +42,7 @@ default = ["_default-rustls-provider"]
 # features of reqwest that `google-cloud-auth` does.
 _internal-http-client = [
   "_internal-common",
+  "_internal-observability",
   "dep:google-cloud-api",
   "dep:hyper",
   "dep:reqwest",
@@ -54,6 +55,7 @@ _internal-http-client = [
 # features of reqwest that `google-cloud-auth` does.
 _internal-grpc-client = [
   "_internal-common",
+  "_internal-observability",
   "dep:h2",
   "dep:http-body",
   "dep:prost",
@@ -86,14 +88,20 @@ _internal-common = [
   "dep:http",
   "dep:http-body-util",
   "dep:lazy_static",
-  "dep:opentelemetry",
-  "dep:opentelemetry-semantic-conventions",
-  "dep:opentelemetry_sdk",
   "dep:percent-encoding",
   "dep:pin-project",
   "dep:thiserror",
   "dep:tokio",
   "dep:tracing",
+]
+# Dependencies for client telemetry. Both transports continue to enable this
+# feature unconditionally; it is not yet a client telemetry opt-out.
+# Keep these separate from the common helpers, which do not emit telemetry.
+_internal-observability = [
+  "_internal-common",
+  "dep:opentelemetry",
+  "dep:opentelemetry-semantic-conventions",
+  "dep:opentelemetry_sdk",
   "dep:tracing-opentelemetry",
 ]
 
