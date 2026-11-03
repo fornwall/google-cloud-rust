@@ -69,7 +69,7 @@ pub(crate) mod headers;
 #[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub(crate) mod host;
 
-#[cfg(feature = "_internal-common")]
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub(crate) mod universe_domain;
 
 #[cfg(feature = "_internal-grpc-client")]

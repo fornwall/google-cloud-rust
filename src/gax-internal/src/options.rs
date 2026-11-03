@@ -46,6 +46,7 @@ pub fn tracing_enabled(config: &ClientConfig) -> bool {
 
 /// Resolve the effective per-attempt timeout for a request, taking into
 /// account a per-request attempt timeout and an optional client-level default.
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub(crate) fn resolve_effective_timeout(
     options: &google_cloud_gax::options::RequestOptions,
     client_attempt_timeout: Option<std::time::Duration>,

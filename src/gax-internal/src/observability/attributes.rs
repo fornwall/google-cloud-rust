@@ -15,6 +15,7 @@
 // OpenTelemetry Semantic Convention Keys
 // See https://opentelemetry.io/docs/specs/semconv/http/http-spans/
 
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub mod keys {
     /// Span Kind for OpenTelemetry interop.
     ///
@@ -104,6 +105,7 @@ pub mod keys {
 }
 
 /// Value for [keys::OTEL_KIND].
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub const OTEL_KIND_CLIENT: &str = "Client";
 /// Value for `rpc.system`.
 #[allow(dead_code)]
@@ -124,6 +126,7 @@ pub mod error_type_values {
     /// A client-configured timeout was reached.
     pub const CLIENT_TIMEOUT: &str = "CLIENT_TIMEOUT";
     /// The operation was cancelled by the caller.
+    #[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
     pub const CLIENT_CANCELLED: &str = "CLIENT_CANCELLED";
     /// Failure to establish the network connection (DNS, TCP, TLS).
     pub const CLIENT_CONNECTION_ERROR: &str = "CLIENT_CONNECTION_ERROR";
@@ -141,6 +144,7 @@ pub mod error_type_values {
 
 // There is no OK constant because in practice an instrumented library should never use it.
 /// Values for the OpenTelemetry `otel.status_code` attribute.
+#[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
 pub mod otel_status_codes {
     /// The operation contains an error.
     pub const ERROR: &str = "ERROR";

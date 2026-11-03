@@ -21,9 +21,13 @@ rustup show active-toolchain -v
 
 cargo clean
 echo "==== google-cloud-gax-internal ===="
+# Unit tests pull both clients in through the echo-server and grpc-server dev
+# dependencies. Check the library separately to exercise each feature in isolation.
+cargo check --package google-cloud-gax-internal --lib --no-default-features
 cargo test --package google-cloud-gax-internal --no-default-features
 cargo doc  --package google-cloud-gax-internal --no-default-features --no-deps
-for feature in _internal-common _internal-http-client _internal-grpc-client _internal-http-multipart _internal-http-stream; do
+for feature in _internal-common _internal-observability _internal-http-client _internal-grpc-client _internal-http-client,_internal-grpc-client _internal-http-multipart _internal-http-stream; do
+    cargo check --package google-cloud-gax-internal --lib --no-default-features --features "${feature}"
     cargo test --package google-cloud-gax-internal --no-default-features --features "${feature}"
     cargo doc  --package google-cloud-gax-internal --no-default-features --features "${feature}" --no-deps
 done
