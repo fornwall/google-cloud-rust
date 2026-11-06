@@ -117,7 +117,14 @@ impl RequestRecorder {
     /// }
     /// ```
     pub fn current() -> Option<Self> {
-        RECORDER.try_get().ok()
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
+        {
+            RECORDER.try_get().ok()
+        }
+        #[cfg(google_cloud_unstable_no_http_telemetry)]
+        {
+            None
+        }
     }
 
     /// Returns the data captured for the client layer.

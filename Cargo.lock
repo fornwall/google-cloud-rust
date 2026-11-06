@@ -9816,6 +9816,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "telemetry-size-repro"
+version = "0.1.0"
+dependencies = [
+ "google-cloud-auth",
+ "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-secretmanager-v1",
+ "httptest",
+ "opentelemetry",
+ "tokio",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -20,10 +20,18 @@ pub mod keys {
     /// Span Kind for OpenTelemetry interop.
     ///
     /// Always "Client" for a span representing an outbound HTTP request.
+    #[cfg(any(
+        not(google_cloud_unstable_no_http_telemetry),
+        feature = "_internal-grpc-client"
+    ))]
     pub const OTEL_KIND: &str = "otel.kind";
     /// Span Name for OpenTelemetry interop.
     ///
     /// If `url.template` is available use "{http.request.method} {url.template}", otherwise use "{http.request.method}".
+    #[cfg(any(
+        not(google_cloud_unstable_no_http_telemetry),
+        feature = "_internal-grpc-client"
+    ))]
     pub const OTEL_NAME: &str = "otel.name";
     /// Span Status Code for OpenTelemetry interop.
     ///
@@ -106,6 +114,10 @@ pub mod keys {
 
 /// Value for [keys::OTEL_KIND].
 #[cfg(any(feature = "_internal-http-client", feature = "_internal-grpc-client"))]
+#[cfg(any(
+    not(google_cloud_unstable_no_http_telemetry),
+    feature = "_internal-grpc-client"
+))]
 pub const OTEL_KIND_CLIENT: &str = "Client";
 /// Value for `rpc.system`.
 #[allow(dead_code)]

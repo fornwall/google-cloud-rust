@@ -12,16 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use crate::observability::attributes::keys::*;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use crate::observability::errors::ErrorType;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use crate::observability::{RequestRecorder, attributes::*};
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use crate::options::InstrumentationClientInfo;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use google_cloud_gax::Result;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use google_cloud_gax::options::RequestOptions;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use google_cloud_gax::options::internal::{PathTemplate, RequestOptionsExt, ResourceName};
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use opentelemetry_semantic_conventions::{attribute as otel_attr, trace as otel_trace};
 use std::collections::HashSet;
 use std::sync::LazyLock;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use tracing::{Span, field};
 
 pub(crate) static REDACTED_QUERY_PARAMETERS: LazyLock<HashSet<&'static str>> =
@@ -42,6 +51,7 @@ pub(crate) static REDACTED_QUERY_PARAMETERS: LazyLock<HashSet<&'static str>> =
 ///
 /// Populates the span with attributes available before the request is sent,
 /// adhering to OpenTelemetry semantic conventions.
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 pub(crate) fn create_http_attempt_span(
     request: &reqwest::Request,
     options: &RequestOptions,
@@ -117,15 +127,19 @@ pub(crate) fn create_http_attempt_span(
 }
 
 /// Records additional attributes to the span based on the `Result`.
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 pub trait ResultExt: sealed::ResultExt {
     fn record_http(self, span: &Span) -> Self;
 }
 
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 mod sealed {
     pub trait ResultExt {}
 }
 
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 impl sealed::ResultExt for Result<reqwest::Response> {}
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 impl ResultExt for Result<reqwest::Response> {
     fn record_http(self, span: &Span) -> Self {
         match &self {
