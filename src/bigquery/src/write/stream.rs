@@ -16,7 +16,6 @@ use super::transport::Transport;
 use crate::google::cloud::bigquery::storage::v1::{AppendRowsRequest, AppendRowsResponse};
 use crate::{Error, Result};
 use gaxi::grpc::tonic::Streaming;
-use google_cloud_gax::options::RequestOptions;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, channel};
 
@@ -43,7 +42,7 @@ async fn open_stream(inner: Arc<Transport>, initial_req: AppendRowsRequest) -> R
     request_tx.send(initial_req).await.map_err(Error::io)?;
 
     let stream = inner
-        .append_rows(&request_params, request_rx, RequestOptions::default())
+        .append_rows(&request_params, request_rx)
         .await?
         .into_inner();
 

@@ -76,17 +76,20 @@ mod tests {
         let (response_tx, response_rx) = mpsc::channel(10);
 
         let mut mock = MockBigQueryWrite::new();
-        mock.expect_append_rows()
-            .return_once(|_| Ok(TonicResponse::from(response_rx)));
+        mock.expect_append_rows().return_once(|req| {
+            check_user_agent(req.metadata());
+            Ok(TonicResponse::from(response_rx))
+        });
 
-        mock.expect_finalize_write_stream().return_once(|_| {
+        mock.expect_finalize_write_stream().return_once(|req| {
+            check_user_agent(req.metadata());
             Ok(TonicResponse::new(
                 bigquery_grpc_mock::google::cloud::bigquery::storage::v1::FinalizeWriteStreamResponse::default(),
             ))
         });
 
         let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
-        let transport = Arc::new(test_transport(endpoint).await?);
+        let transport = Arc::new(test_transport_with_user_agent(endpoint).await?);
 
         let writer = CommittedWriter::new(transport, write_stream(), format());
         assert_eq!(writer.write_stream(), write_stream());

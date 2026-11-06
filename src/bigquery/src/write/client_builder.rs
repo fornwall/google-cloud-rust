@@ -15,6 +15,7 @@
 use super::pool::StreamPoolOptions;
 use super::retry_policy::RetryOptions;
 use crate::ClientBuilderResult as BuilderResult;
+use crate::RequestOptions;
 use crate::client::Write;
 use gaxi::options::ClientConfig;
 use google_cloud_auth::credentials::Credentials;
@@ -38,6 +39,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct ClientBuilder {
     pub(super) config: ClientConfig,
+    pub(super) request_options: RequestOptions,
     pub(super) pool_options: StreamPoolOptions,
     pub(super) retry_options: RetryOptions,
 }
@@ -46,6 +48,7 @@ impl ClientBuilder {
     pub(super) fn new() -> Self {
         Self {
             config: ClientConfig::default(),
+            request_options: RequestOptions::default(),
             pool_options: StreamPoolOptions::default(),
             retry_options: RetryOptions::default(),
         }
@@ -62,6 +65,26 @@ impl ClientBuilder {
     /// ```
     pub async fn build(self) -> BuilderResult<Write> {
         Write::new(self).await
+    }
+
+    /// Sets the user agent header for requests made by this client and its writers.
+    ///
+    /// This includes append requests on shared streams and replacement streams
+    /// opened when retrying a write.
+    ///
+    /// # Example
+    /// ```
+    /// # use google_cloud_bigquery::client::Write;
+    /// # async fn sample() -> anyhow::Result<()> {
+    /// let client = Write::builder()
+    ///     .with_user_agent("my-app/1.2.3")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.request_options.set_user_agent(user_agent);
+        self
     }
 
     /// Sets the endpoint.

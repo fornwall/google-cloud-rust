@@ -14,7 +14,6 @@
 
 use super::DefaultWriter;
 use super::format::{Arrow, DataFormat, Proto};
-use super::generated::gapic_storage::client::BigQueryWrite;
 use super::pool::{StreamPool, StreamPoolOptions};
 use super::retry_policy::RetryOptions;
 use super::transport::Transport;
@@ -332,9 +331,10 @@ impl<S: Stream> WriterBuilder<S> {
         validate_table(table)?;
         let write_stream = format!("{table}/streams/_default");
         let location = if self.multiplexing {
-            let client = BigQueryWrite::from_stub::<Transport>(self.inner.clone());
+            let client = self.inner.client();
             let stream = client
                 .get_write_stream()
+                .with_options(self.inner.options.clone())
                 .set_name(&write_stream)
                 .send()
                 .await?;
@@ -352,9 +352,10 @@ impl<S: Stream> WriterBuilder<S> {
     ) -> std::result::Result<String, WriterBuilderError> {
         validate_table(table)?;
 
-        let client = BigQueryWrite::from_stub::<Transport>(self.inner.clone());
+        let client = self.inner.client();
         let stream = client
             .create_write_stream()
+            .with_options(self.inner.options.clone())
             .set_parent(table)
             .set_write_stream(WriteStream::new().set_type(stream_type))
             .send()
@@ -377,9 +378,10 @@ impl<S: Stream> WriterBuilder<S> {
             });
         }
 
-        let client = BigQueryWrite::from_stub::<Transport>(self.inner.clone());
+        let client = self.inner.client();
         let stream = client
             .get_write_stream()
+            .with_options(self.inner.options.clone())
             .set_name(write_stream)
             .send()
             .await?;
@@ -481,6 +483,7 @@ mod tests {
     async fn create_mock(stream_type: Type) -> anyhow::Result<(Arc<Transport>, JoinHandle<()>)> {
         let mut mock = MockBigQueryWrite::new();
         mock.expect_create_write_stream().return_once(move |req| {
+            check_user_agent(req.metadata());
             let req = req.into_inner();
             assert_eq!(req.parent, "projects/p/datasets/d/tables/t");
             let ws = req.write_stream.expect("write_stream populated");
@@ -492,7 +495,7 @@ mod tests {
             }))
         });
         let (endpoint, server) = start("0.0.0.0:0", mock).await?;
-        let transport = Arc::new(test_transport(endpoint).await?);
+        let transport = Arc::new(test_transport_with_user_agent(endpoint).await?);
         Ok((transport, server))
     }
 
@@ -559,6 +562,7 @@ mod tests {
     async fn attach_mock(stream_type: Type) -> anyhow::Result<(Arc<Transport>, JoinHandle<()>)> {
         let mut mock = MockBigQueryWrite::new();
         mock.expect_get_write_stream().return_once(move |req| {
+            check_user_agent(req.metadata());
             let req = req.into_inner();
             assert_eq!(req.name, "projects/p/datasets/d/tables/t/streams/s");
             Ok(gaxi::grpc::tonic::Response::new(MockWriteStream {
@@ -568,7 +572,7 @@ mod tests {
             }))
         });
         let (endpoint, server) = start("0.0.0.0:0", mock).await?;
-        let transport = Arc::new(test_transport(endpoint).await?);
+        let transport = Arc::new(test_transport_with_user_agent(endpoint).await?);
         Ok((transport, server))
     }
 

@@ -12,12 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(super) use super::generated::gapic_storage::transport::BigQueryWrite as Transport;
-use crate::Result;
+use super::generated::gapic_storage::{
+    client::BigQueryWrite, transport::BigQueryWrite as GrpcTransport,
+};
 use crate::google::cloud::bigquery::storage::v1::{AppendRowsRequest, AppendRowsResponse};
+use crate::{RequestOptions, Result};
 use gaxi::grpc::tonic::{Response as TonicResponse, Streaming};
+use gaxi::options::ClientConfig;
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Shared transport and request options for all writers created by a client.
+#[derive(Debug)]
+pub(crate) struct Transport {
+    inner: Arc<GrpcTransport>,
+    pub(crate) options: RequestOptions,
+}
 
 pub(super) mod info {
     use std::sync::LazyLock;
@@ -35,11 +46,24 @@ pub(super) mod info {
 }
 
 impl Transport {
+    pub(crate) async fn new(
+        config: ClientConfig,
+        options: RequestOptions,
+    ) -> crate::ClientBuilderResult<Self> {
+        Ok(Self {
+            inner: Arc::new(GrpcTransport::new(config).await?),
+            options,
+        })
+    }
+
+    pub(crate) fn client(&self) -> BigQueryWrite {
+        BigQueryWrite::from_stub::<GrpcTransport>(self.inner.clone())
+    }
+
     pub(crate) async fn append_rows(
         &self,
         request_params: &str,
         request_rx: Receiver<AppendRowsRequest>,
-        options: crate::RequestOptions,
     ) -> Result<TonicResponse<Streaming<AppendRowsResponse>>> {
         use gaxi::grpc::tonic::{Extensions, GrpcMethod};
         let request = ReceiverStream::new(request_rx);
@@ -55,11 +79,12 @@ impl Transport {
             "/google.cloud.bigquery.storage.v1.BigQueryWrite/AppendRows",
         );
         self.inner
+            .inner
             .bidi_stream(
                 extensions,
                 path,
                 request,
-                options,
+                self.options.clone(),
                 &info::X_GOOG_API_CLIENT_HEADER,
                 request_params,
             )
@@ -110,7 +135,6 @@ mod tests {
             .append_rows(
                 "write_stream=projects/p/datasets/d/tables/t/streams/s",
                 request_rx,
-                crate::RequestOptions::default(),
             )
             .await?
             .into_inner();
