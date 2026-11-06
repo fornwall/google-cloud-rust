@@ -38,7 +38,7 @@ impl Write {
     }
 
     pub(crate) async fn new(builder: ClientBuilder) -> BuilderResult<Self> {
-        let inner = Arc::new(Transport::new(builder.config).await?);
+        let inner = Arc::new(Transport::new(builder.config, builder.request_options).await?);
         let pools = Arc::new(Mutex::new(HashMap::new()));
         Ok(Self {
             inner,
@@ -171,9 +171,81 @@ mod tests {
     use super::super::error::AppendError;
     use super::*;
     use crate::model::{ArrowRecordBatch, ArrowSchema, ProtoRows, ProtoSchema};
+    use crate::write::retry_policy::RetryableErrors;
+    use crate::write::test::{
+        NoBackoff, USER_AGENT, check_user_agent, convert, rows, schema, test_response,
+    };
+    use bigquery_grpc_mock::google::cloud::bigquery::storage::v1;
     use bigquery_grpc_mock::{MockBigQueryWrite, start};
-    use gaxi::grpc::tonic::Status as TonicStatus;
+    use gaxi::grpc::tonic::{Response as TonicResponse, Status as TonicStatus};
     use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+    use google_cloud_gax::retry_policy::RetryPolicyExt;
+    use test_case::test_case;
+    use tokio::sync::mpsc;
+
+    #[test_case(false; "standalone")]
+    #[test_case(true; "multiplexed")]
+    #[tokio::test]
+    async fn default_stream_user_agent(multiplexing: bool) -> anyhow::Result<()> {
+        let (response_tx, response_rx) = mpsc::channel(1);
+        let mut mock = MockBigQueryWrite::new();
+        if multiplexing {
+            mock.expect_get_write_stream()
+                .times(2)
+                .returning(move |req| {
+                    check_user_agent(req.metadata());
+                    Ok(TonicResponse::new(v1::WriteStream {
+                        name: req.into_inner().name,
+                        location: "us".to_string(),
+                        ..Default::default()
+                    }))
+                });
+        }
+        let mut sequence = mockall::Sequence::new();
+        mock.expect_append_rows()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |req| {
+                check_user_agent(req.metadata());
+                Err(TonicStatus::unavailable("retry opening the stream"))
+            });
+        mock.expect_append_rows()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |req| {
+                check_user_agent(req.metadata());
+                Ok(TonicResponse::from(response_rx))
+            });
+        let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
+        let client = Write::builder()
+            .with_endpoint(endpoint)
+            .with_credentials(Anonymous::new().build())
+            .with_user_agent(USER_AGENT)
+            .build()
+            .await?;
+        let writer = client
+            .open_default_stream("projects/p/datasets/d/tables/t")
+            .with_multiplexing(multiplexing)
+            .with_retry_policy(RetryableErrors.with_attempt_limit(2))
+            .with_backoff_policy(NoBackoff)
+            .with_attempt_timeout(std::time::Duration::from_secs(5))
+            .build_arrow(schema())
+            .await?;
+        response_tx.send(Ok(convert(&test_response(1)))).await?;
+        assert_eq!(writer.append(rows(1)).send().await?.offset, Some(1));
+
+        if multiplexing {
+            let other = client
+                .open_default_stream("projects/p/datasets/d/tables/other")
+                .with_multiplexing(true)
+                .build_arrow(schema())
+                .await?;
+            assert!(Arc::ptr_eq(&writer.inner.pool, &other.inner.pool));
+            response_tx.send(Ok(convert(&test_response(2)))).await?;
+            assert_eq!(other.append(rows(2)).send().await?.offset, Some(2));
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn arrow() -> anyhow::Result<()> {

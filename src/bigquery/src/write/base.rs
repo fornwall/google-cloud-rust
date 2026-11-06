@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use super::format::DataFormat;
-use crate::Result;
 use crate::model::{AppendRowsRequest, FinalizeWriteStreamResponse};
 use crate::write::generated::gapic_storage::client::BigQueryWrite;
 use crate::write::runner::Runner;
 use crate::write::transport::Transport;
+use crate::{RequestOptions, Result};
 use std::sync::Arc;
 
 /// A shared internal structure for holding common state across different stream types,
@@ -27,6 +27,7 @@ use std::sync::Arc;
 /// structs (e.g. `BufferedWriter`, `CommittedWriter`, `PendingWriter`).
 #[derive(Debug)]
 pub(crate) struct BaseWriter<F> {
+    pub(crate) request_options: RequestOptions,
     pub(crate) runner: Runner,
     pub(crate) write_stream: String,
     pub(crate) format: F,
@@ -39,8 +40,9 @@ where
 {
     pub(crate) fn new(inner: Arc<Transport>, write_stream: String, format: F) -> Self {
         let runner = Runner::new(inner.clone());
-        let client = BigQueryWrite::from_stub::<Transport>(inner);
+        let client = inner.client();
         Self {
+            request_options: inner.options.clone(),
             runner,
             write_stream,
             format,
@@ -55,6 +57,7 @@ where
     pub(crate) async fn finalize(&self) -> Result<FinalizeWriteStreamResponse> {
         self.client
             .finalize_write_stream()
+            .with_options(self.request_options.clone())
             .set_name(&self.write_stream)
             .send()
             .await

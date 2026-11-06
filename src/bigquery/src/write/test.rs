@@ -26,6 +26,7 @@ use crate::google::cloud::bigquery::storage::v1::{AppendRowsRequest, AppendRowsR
 use crate::model::{ArrowRecordBatch, ArrowSchema, ProtoSchema};
 use bigquery_grpc_mock::google::cloud::bigquery::storage::v1;
 use bytes::Bytes;
+use gaxi::grpc::tonic::MetadataMap;
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_gax::backoff_policy::BackoffPolicy;
 use google_cloud_gax::retry_policy::NeverRetry;
@@ -81,7 +82,28 @@ pub(super) async fn test_transport<T: Into<String>>(endpoint: T) -> anyhow::Resu
     let mut config = gaxi::options::ClientConfig::default();
     config.cred = Some(Anonymous::new().build());
     config.endpoint = Some(endpoint.into());
-    Ok(Transport::new(config).await?)
+    Ok(Transport::new(config, crate::RequestOptions::default()).await?)
+}
+
+pub(super) const USER_AGENT: &str = "my-app/1.2.3";
+
+pub(super) fn check_user_agent(metadata: &MetadataMap) {
+    let header = metadata.get("user-agent").expect("user-agent header");
+    // Tonic also includes its own user-agent component.
+    assert!(
+        header
+            .to_str()
+            .unwrap()
+            .split_whitespace()
+            .any(|v| v == USER_AGENT),
+        "{header:?}"
+    );
+}
+
+pub(super) async fn test_transport_with_user_agent(endpoint: String) -> anyhow::Result<Transport> {
+    let mut transport = test_transport(endpoint).await?;
+    transport.options.set_user_agent(USER_AGENT);
+    Ok(transport)
 }
 
 // Both crates have their own copies of the protos. We can just serialize

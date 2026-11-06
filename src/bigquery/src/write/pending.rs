@@ -82,6 +82,7 @@ where
             .inner
             .client
             .batch_commit_write_streams()
+            .with_options(self.inner.request_options.clone())
             .set_parent(parent)
             .set_write_streams(vec![self.inner.write_stream.clone()])
             .send()
@@ -113,16 +114,20 @@ mod tests {
         let (response_tx, response_rx) = mpsc::channel(10);
 
         let mut mock = MockBigQueryWrite::new();
-        mock.expect_append_rows()
-            .return_once(|_| Ok(TonicResponse::from(response_rx)));
+        mock.expect_append_rows().return_once(|req| {
+            check_user_agent(req.metadata());
+            Ok(TonicResponse::from(response_rx))
+        });
 
-        mock.expect_finalize_write_stream().return_once(|_| {
+        mock.expect_finalize_write_stream().return_once(|req| {
+            check_user_agent(req.metadata());
             Ok(TonicResponse::new(
                 v1::FinalizeWriteStreamResponse::default(),
             ))
         });
 
-        mock.expect_batch_commit_write_streams().return_once(|_| {
+        mock.expect_batch_commit_write_streams().return_once(|req| {
+            check_user_agent(req.metadata());
             Ok(TonicResponse::new(v1::BatchCommitWriteStreamsResponse {
                 commit_time: Some(prost_types::Timestamp {
                     seconds: 1_700_000_000,
@@ -133,7 +138,7 @@ mod tests {
         });
 
         let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
-        let transport = Arc::new(test_transport(endpoint).await?);
+        let transport = Arc::new(test_transport_with_user_agent(endpoint).await?);
 
         let writer = PendingWriter::new(transport, write_stream(), format());
         assert_eq!(writer.write_stream(), write_stream());
