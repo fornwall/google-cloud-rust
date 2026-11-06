@@ -32,7 +32,10 @@ pub mod errors;
 #[cfg(feature = "_internal-http-client")]
 pub(crate) mod http_tracing;
 
-#[cfg(feature = "_internal-http-client")]
+#[cfg(all(
+    feature = "_internal-http-client",
+    not(google_cloud_unstable_no_http_telemetry)
+))]
 pub(crate) use http_tracing::{ResultExt as HttpResultExt, create_http_attempt_span};
 
 #[cfg(feature = "_internal-grpc-client")]

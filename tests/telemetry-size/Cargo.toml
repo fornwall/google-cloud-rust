@@ -1,0 +1,34 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name              = "telemetry-size-repro"
+version           = "0.1.0"
+publish           = false
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+google-cloud-secretmanager-v1 = { workspace = true, features = ["default-rustls-provider"] }
+tokio                         = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+google-cloud-auth.workspace = true
+google-cloud-gax.workspace  = true
+gaxi                        = { workspace = true, features = ["_internal-http-client"] }
+httptest.workspace          = true
+opentelemetry               = { workspace = true, features = ["trace"] }

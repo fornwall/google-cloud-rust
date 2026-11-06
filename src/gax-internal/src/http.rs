@@ -27,6 +27,7 @@ pub mod reqwest;
 use crate::as_inner::as_inner;
 use crate::attempt_info::AttemptInfo;
 use crate::headers::{X_GOOG_API_CLIENT, X_GOOG_USER_PROJECT, sanitize_custom_headers};
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use crate::observability::{HttpResultExt, RequestRecorder, create_http_attempt_span};
 use crate::universe_domain::DEFAULT_UNIVERSE_DOMAIN;
 use ::reqwest::Url;
@@ -57,6 +58,7 @@ use reqwest::Method;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 use tracing::Instrument;
 
 #[derive(Clone, Debug)]
@@ -71,9 +73,12 @@ pub struct ReqwestClient {
     polling_error_policy: Arc<dyn PollingErrorPolicy>,
     polling_backoff_policy: Arc<dyn PollingBackoffPolicy>,
     attempt_timeout: Option<Duration>,
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     instrumentation: Option<&'static crate::options::InstrumentationClientInfo>,
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     _tracing_enabled: bool,
     universe_domain: String,
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     transport_metric: Option<crate::observability::TransportMetric>,
     extensions: crate::options::Extensions,
 }
@@ -110,6 +115,7 @@ impl ReqwestClient {
         )
         .map_err(|e| e.client_builder())?;
         let service_endpoint = default_endpoint.replace(DEFAULT_UNIVERSE_DOMAIN, &universe_domain);
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
         let tracing_enabled = crate::options::tracing_enabled(&config);
         let endpoint = config.endpoint.as_deref().unwrap_or(&service_endpoint);
         let url = Url::parse(endpoint).map_err(BuilderError::transport)?;
@@ -135,15 +141,19 @@ impl ReqwestClient {
             polling_backoff_policy: config
                 .polling_backoff_policy
                 .unwrap_or_else(|| Arc::new(ExponentialBackoff::default())),
+            #[cfg(not(google_cloud_unstable_no_http_telemetry))]
             instrumentation: None,
+            #[cfg(not(google_cloud_unstable_no_http_telemetry))]
             _tracing_enabled: tracing_enabled,
             universe_domain,
             attempt_timeout: config.attempt_timeout,
+            #[cfg(not(google_cloud_unstable_no_http_telemetry))]
             transport_metric: None,
             extensions: config.extensions,
         })
     }
 
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     pub fn with_instrumentation(
         mut self,
         instrumentation: &'static crate::options::InstrumentationClientInfo,
@@ -154,6 +164,14 @@ impl ReqwestClient {
                 instrumentation,
             )));
         }
+        self
+    }
+
+    #[cfg(google_cloud_unstable_no_http_telemetry)]
+    pub fn with_instrumentation(
+        self,
+        _: &'static crate::options::InstrumentationClientInfo,
+    ) -> Self {
         self
     }
 
@@ -292,6 +310,7 @@ impl ReqwestClient {
         let request = self
             .request(builder, &options, attempt_info.remaining_time)
             .await?;
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
         if self._tracing_enabled {
             return self
                 .execute_http_traced(request, options, attempt_info)
@@ -300,6 +319,7 @@ impl ReqwestClient {
         self.execute_http_inner(request).await
     }
 
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     async fn execute_http_traced(
         &self,
         request: reqwest::Request,
@@ -328,14 +348,19 @@ impl ReqwestClient {
         result.record_http(&span)
     }
 
-    async fn execute_http_inner(&self, mut request: reqwest::Request) -> Result<reqwest::Response> {
+    async fn execute_http_inner(&self, request: reqwest::Request) -> Result<reqwest::Response> {
         // We want to send the tracing propagation headers even if tracing is disabled in the
         // client. A global trace (say from the incoming HTTP request to Cloud Run) could be
         // propagated.
-        crate::observability::propagation::inject_context(
-            &tracing::Span::current(),
-            request.headers_mut(),
-        );
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
+        let request = {
+            let mut request = request;
+            crate::observability::propagation::inject_context(
+                &tracing::Span::current(),
+                request.headers_mut(),
+            );
+            request
+        };
         self.inner.execute(request).await.map_err(map_send_error)
     }
 
@@ -478,6 +503,7 @@ impl ReqwestClient {
         _attempt_count: u32,
     ) -> Result<reqwest::Response> {
         let request = self.request(builder, options, remaining_time).await?;
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
         if self._tracing_enabled {
             return self
                 .request_attempt_traced(request, options, _attempt_count)
@@ -486,6 +512,7 @@ impl ReqwestClient {
         self.request_attempt_inner(request).await
     }
 
+    #[cfg(not(google_cloud_unstable_no_http_telemetry))]
     async fn request_attempt_traced(
         &self,
         request: reqwest::Request,
@@ -507,18 +534,21 @@ impl ReqwestClient {
         crate::observability::WithTransportSpan::new(span, pending).await
     }
 
-    async fn request_attempt_inner(
-        &self,
-        mut request: reqwest::Request,
-    ) -> Result<reqwest::Response> {
+    async fn request_attempt_inner(&self, request: reqwest::Request) -> Result<reqwest::Response> {
         // We want to send the tracing propagation headers even if tracing is disabled in the
         // client. A global trace (say from the incoming HTTP request to Cloud Run) could be
         // propagated.
-        crate::observability::propagation::inject_context(
-            &tracing::Span::current(),
-            request.headers_mut(),
-        );
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
+        let request = {
+            let mut request = request;
+            crate::observability::propagation::inject_context(
+                &tracing::Span::current(),
+                request.headers_mut(),
+            );
+            request
+        };
         let result = self.inner.execute(request).await.map_err(map_send_error);
+        #[cfg(not(google_cloud_unstable_no_http_telemetry))]
         if let Some(recorder) = RequestRecorder::current() {
             match &result {
                 Ok(r) => recorder.on_http_response(r),

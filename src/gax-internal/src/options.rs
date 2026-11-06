@@ -18,6 +18,7 @@ pub use google_cloud_gax::client_builder::internal::Extensions;
 // The client configuration for [crate::http::ReqwestClient] and [crate::grpc::Client].
 pub type ClientConfig = google_cloud_gax::client_builder::internal::ClientConfig<Credentials>;
 
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 pub(crate) const LOGGING_VAR: &str = "GOOGLE_CLOUD_RUST_LOGGING";
 
 /// Information about the client library used for instrumentation.
@@ -35,6 +36,7 @@ pub struct InstrumentationClientInfo {
 }
 
 // Returns true if the environment or client configuration enables tracing.
+#[cfg(not(google_cloud_unstable_no_http_telemetry))]
 pub fn tracing_enabled(config: &ClientConfig) -> bool {
     if config.tracing {
         return true;
@@ -42,6 +44,11 @@ pub fn tracing_enabled(config: &ClientConfig) -> bool {
     std::env::var(LOGGING_VAR)
         .map(|v| v == "true")
         .unwrap_or(false)
+}
+
+#[cfg(google_cloud_unstable_no_http_telemetry)]
+pub fn tracing_enabled(_: &ClientConfig) -> bool {
+    false
 }
 
 /// Resolve the effective per-attempt timeout for a request, taking into

@@ -24,6 +24,14 @@
 //! This is intentional, as they are not intended for general use and will be
 //! changed without notice.
 
+// This switch is only for the HTTP telemetry size experiment. A public opt-out
+// must also handle gRPC and Cargo dependency selection.
+#[cfg(all(
+    google_cloud_unstable_no_http_telemetry,
+    feature = "_internal-grpc-client"
+))]
+compile_error!("google_cloud_unstable_no_http_telemetry only supports HTTP clients");
+
 #[cfg(feature = "_internal-common")]
 pub mod api_header;
 
